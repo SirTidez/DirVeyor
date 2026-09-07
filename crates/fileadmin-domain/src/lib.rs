@@ -31,6 +31,8 @@ impl PaneId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
+    Parent,
+    Drive,
     Directory,
     File,
     Symlink,
@@ -49,7 +51,18 @@ pub struct FileEntry {
 
 impl FileEntry {
     pub fn is_directory(&self) -> bool {
-        self.kind == EntryKind::Directory
+        matches!(
+            self.kind,
+            EntryKind::Parent | EntryKind::Drive | EntryKind::Directory
+        )
+    }
+
+    pub fn is_parent(&self) -> bool {
+        self.kind == EntryKind::Parent
+    }
+
+    pub fn is_drive(&self) -> bool {
+        self.kind == EntryKind::Drive
     }
 }
 
@@ -97,6 +110,7 @@ pub struct PaneState {
     pub load_state: LoadState,
     pub generation: u64,
     pub truncated: bool,
+    pub browsing_drives: bool,
 }
 
 impl PaneState {
@@ -112,6 +126,7 @@ impl PaneState {
             load_state: LoadState::Loading,
             generation: 0,
             truncated: false,
+            browsing_drives: false,
         }
     }
 
@@ -122,6 +137,19 @@ impl PaneState {
         self.selected.clear();
         self.load_state = LoadState::Loading;
         self.truncated = false;
+        self.browsing_drives = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    pub fn begin_drive_list(&mut self) -> u64 {
+        self.location = PathBuf::new();
+        self.entries.clear();
+        self.cursor = 0;
+        self.selected.clear();
+        self.load_state = LoadState::Loading;
+        self.truncated = false;
+        self.browsing_drives = true;
         self.generation = self.generation.wrapping_add(1);
         self.generation
     }
@@ -156,8 +184,10 @@ impl PaneState {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                (self.show_hidden || !is_dot_hidden(&entry.display_name))
-                    && (needle.is_empty() || entry.display_name.to_lowercase().contains(&needle))
+                entry.is_parent()
+                    || ((self.show_hidden || !is_dot_hidden(&entry.display_name))
+                        && (needle.is_empty()
+                            || entry.display_name.to_lowercase().contains(&needle)))
             })
             .map(|(index, _)| index)
             .collect()
@@ -181,6 +211,12 @@ impl PaneState {
         let Some(path) = self.focused().map(|entry| entry.path.clone()) else {
             return;
         };
+        if self
+            .focused()
+            .is_some_and(|entry| entry.is_parent() || entry.is_drive())
+        {
+            return;
+        }
         if !self.selected.remove(&path) {
             self.selected.insert(path);
         }
@@ -216,6 +252,10 @@ impl PaneState {
     fn sort_entries(&mut self) {
         let sort = self.sort;
         self.entries.sort_by(|a, b| {
+            let parent_order = b.is_parent().cmp(&a.is_parent());
+            if !parent_order.is_eq() {
+                return parent_order;
+            }
             let directory_order = b.is_directory().cmp(&a.is_directory());
             if !directory_order.is_eq() {
                 return directory_order;
@@ -382,5 +422,26 @@ mod tests {
     fn root_parent_navigation_is_harmless() {
         let root = Path::new(std::path::MAIN_SEPARATOR_STR);
         assert_eq!(parent_or_same(root), root);
+    }
+
+    #[test]
+    fn parent_row_stays_first_and_cannot_be_selected() {
+        let mut pane = PaneState::new(PathBuf::from("root/child"));
+        pane.apply_entries(
+            0,
+            vec![
+                entry("file", EntryKind::File, 1),
+                entry("parent", EntryKind::Parent, 0),
+                entry("folder", EntryKind::Directory, 0),
+            ],
+        );
+
+        assert!(pane.focused().unwrap().is_parent());
+        pane.toggle_focused_selection();
+        assert!(pane.selected.is_empty());
+
+        pane.set_filter("does-not-match".into());
+        assert_eq!(pane.visible_len(), 1);
+        assert!(pane.focused().unwrap().is_parent());
     }
 }

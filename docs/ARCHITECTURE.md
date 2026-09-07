@@ -33,6 +33,8 @@ Pure application data with no terminal or filesystem dependencies:
 
 - left/right pane identifiers;
 - file entry metadata and kinds;
+- a synthetic, non-selectable `..` parent entry, including a Windows drive-list
+  transition at drive roots;
 - focus and stable path-based selection;
 - filtering, hidden-dotfile policy, and deterministic sorting;
 - loading, ready, and failed states;
@@ -126,4 +128,3 @@ copy or move, including source/destination relationships, estimated scope,
 conflicts, capacity uncertainty, link policy, verification policy, and recovery
 implications. Execution should remain disabled until plan validation and review
 states are tested.
-

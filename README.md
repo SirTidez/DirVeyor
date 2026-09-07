@@ -27,7 +27,7 @@ Common controls:
 | Arrow keys or `j`/`k` | Move focus |
 | `Space` | Toggle selection |
 | `Enter` | Open a directory or retry a failed scan |
-| `Backspace` | Go to the parent directory |
+| `Enter` on `..` or `Backspace` | Go to the parent directory; from a Windows drive root, show all drives |
 | `/` | Filter the active pane |
 | `h` | Toggle dotfiles |
 | `s` | Cycle sort field |

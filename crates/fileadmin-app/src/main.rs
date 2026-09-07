@@ -6,7 +6,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fileadmin_domain::{AppState, LoadState, PaneId, parent_or_same};
-use fileadmin_fs::{DirectoryScanner, RequestError, ScanRequest};
+use fileadmin_fs::{DirectoryScanner, RequestError, ScanLocation, ScanRequest};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::error::Error;
@@ -57,7 +57,7 @@ fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner) {
         let request = ScanRequest {
             pane: pane_id,
             generation: pane.generation,
-            path: pane.location.clone(),
+            location: ScanLocation::Directory(pane.location.clone()),
         };
         if let Err(error) = scanner.request(request) {
             let generation = app.pane(pane_id).generation;
@@ -130,7 +130,7 @@ fn handle_key(app: &mut AppState, scanner: &DirectoryScanner, key: KeyEvent) {
         }
         KeyCode::Char(' ') => app.active_mut().toggle_focused_selection(),
         KeyCode::Enter => open_focused_or_retry(app, scanner),
-        KeyCode::Backspace => navigate_to(app, scanner, parent_or_same(&app.active().location)),
+        KeyCode::Backspace => navigate_parent(app, scanner),
         KeyCode::Char('/') => {
             app.filter_mode = true;
             app.notice = Some("Type to filter this pane; Enter or Esc closes the filter".into());
@@ -165,6 +165,10 @@ fn handle_key(app: &mut AppState, scanner: &DirectoryScanner, key: KeyEvent) {
 
 fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner) {
     let target = match &app.active().load_state {
+        LoadState::Failed(_) if app.active().browsing_drives => {
+            navigate_to_drives(app, scanner);
+            return;
+        }
         LoadState::Failed(_) => Some(app.active().location.clone()),
         _ => app
             .active()
@@ -174,7 +178,16 @@ fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner) {
     };
 
     if let Some(target) = target {
-        navigate_to(app, scanner, target);
+        if target.as_os_str().is_empty()
+            && app
+                .active()
+                .focused()
+                .is_some_and(|entry| entry.is_parent())
+        {
+            navigate_to_drives(app, scanner);
+        } else {
+            navigate_to(app, scanner, target);
+        }
     } else if let Some(entry) = app.active().focused() {
         app.notice = Some(format!(
             "Inspecting {} (opening files is not enabled)",
@@ -184,17 +197,45 @@ fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner) {
 }
 
 fn navigate_to(app: &mut AppState, scanner: &DirectoryScanner, target: PathBuf) {
-    if target == app.active().location && target.parent().is_none() {
-        app.notice = Some("Already at the filesystem root".into());
-        return;
-    }
-
     let pane_id = app.active_pane;
     let generation = app.active_mut().begin_load(target.clone());
     let request = ScanRequest {
         pane: pane_id,
         generation,
-        path: target,
+        location: ScanLocation::Directory(target),
+    };
+    if let Err(error) = scanner.request(request) {
+        app.active_mut()
+            .apply_error(generation, request_error_message(error));
+    }
+}
+
+fn navigate_parent(app: &mut AppState, scanner: &DirectoryScanner) {
+    if app.active().browsing_drives {
+        app.notice = Some("Already viewing all available drives".into());
+        return;
+    }
+    let current = app.active().location.clone();
+    let parent = parent_or_same(&current);
+    if parent == current {
+        #[cfg(windows)]
+        navigate_to_drives(app, scanner);
+        #[cfg(not(windows))]
+        {
+            app.notice = Some("Already at the filesystem root".into());
+        }
+    } else {
+        navigate_to(app, scanner, parent);
+    }
+}
+
+fn navigate_to_drives(app: &mut AppState, scanner: &DirectoryScanner) {
+    let pane_id = app.active_pane;
+    let generation = app.active_mut().begin_drive_list();
+    let request = ScanRequest {
+        pane: pane_id,
+        generation,
+        location: ScanLocation::Drives,
     };
     if let Err(error) = scanner.request(request) {
         app.active_mut()

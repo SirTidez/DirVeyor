@@ -17,14 +17,19 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 pub struct ScanRequest {
     pub pane: PaneId,
     pub generation: u64,
-    pub path: PathBuf,
+    pub location: ScanLocation,
+}
+
+#[derive(Clone, Debug)]
+pub enum ScanLocation {
+    Directory(PathBuf),
+    Drives,
 }
 
 #[derive(Debug)]
 pub struct ScanEvent {
     pub pane: PaneId,
     pub generation: u64,
-    pub path: PathBuf,
     pub result: Result<DirectoryListing, ScanError>,
 }
 
@@ -137,8 +142,10 @@ fn worker_loop(requests: Arc<Mutex<Receiver<ScanRequest>>>, results: SyncSender<
         let event = ScanEvent {
             pane: request.pane,
             generation: request.generation,
-            path: request.path.clone(),
-            result: scan_directory(&request.path),
+            result: match request.location {
+                ScanLocation::Directory(path) => scan_directory(&path),
+                ScanLocation::Drives => scan_drives(),
+            },
         };
         if results.send(event).is_err() {
             break;
@@ -149,9 +156,13 @@ fn worker_loop(requests: Arc<Mutex<Receiver<ScanRequest>>>, results: SyncSender<
 pub fn scan_directory(path: &Path) -> Result<DirectoryListing, ScanError> {
     let reader = fs::read_dir(path).map_err(ScanError::from_io)?;
     let mut entries = Vec::new();
+    if let Some(parent) = parent_entry(path) {
+        entries.push(parent);
+    }
     let mut truncated = false;
+    let mut discovered = 0;
     for item in reader {
-        if entries.len() == MAX_DIRECTORY_ENTRIES {
+        if discovered == MAX_DIRECTORY_ENTRIES {
             truncated = true;
             break;
         }
@@ -194,8 +205,76 @@ pub fn scan_directory(path: &Path) -> Result<DirectoryListing, ScanError> {
             modified,
             metadata_incomplete,
         });
+        discovered += 1;
     }
     Ok(DirectoryListing { entries, truncated })
+}
+
+fn parent_entry(path: &Path) -> Option<FileEntry> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        return Some(FileEntry {
+            path: parent.to_path_buf(),
+            display_name: "..".into(),
+            kind: EntryKind::Parent,
+            size: None,
+            modified: None,
+            metadata_incomplete: false,
+        });
+    }
+
+    drive_root_parent_entry()
+}
+
+#[cfg(windows)]
+fn drive_root_parent_entry() -> Option<FileEntry> {
+    Some(FileEntry {
+        path: PathBuf::new(),
+        display_name: "..  All drives".into(),
+        kind: EntryKind::Parent,
+        size: None,
+        modified: None,
+        metadata_incomplete: false,
+    })
+}
+
+#[cfg(not(windows))]
+fn drive_root_parent_entry() -> Option<FileEntry> {
+    None
+}
+
+#[cfg(windows)]
+fn scan_drives() -> Result<DirectoryListing, ScanError> {
+    let entries = (b'A'..=b'Z')
+        .filter_map(|letter| {
+            let path = PathBuf::from(format!("{}:\\", letter as char));
+            path.try_exists()
+                .ok()
+                .filter(|exists| *exists)
+                .map(|_| FileEntry {
+                    display_name: path.to_string_lossy().into_owned(),
+                    path,
+                    kind: EntryKind::Drive,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                })
+        })
+        .collect();
+    Ok(DirectoryListing {
+        entries,
+        truncated: false,
+    })
+}
+
+#[cfg(not(windows))]
+fn scan_drives() -> Result<DirectoryListing, ScanError> {
+    Err(ScanError {
+        kind: ScanErrorKind::Other,
+        message: "Drive selection is only available on Windows".into(),
+    })
 }
 
 pub fn sanitize_display_name(name: &str) -> String {
@@ -234,8 +313,13 @@ mod tests {
         let listing = scan_directory(temp.path()).unwrap();
         let entries = listing.entries;
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(!listing.truncated);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.display_name == ".." && entry.kind == EntryKind::Parent })
+        );
         assert!(entries.iter().any(|entry| {
             entry.display_name == "note.txt"
                 && entry.kind == EntryKind::File
@@ -265,5 +349,15 @@ mod tests {
             sanitize_display_name("hello\nworld\u{1b}\u{202e}txt.exe"),
             "hello�world��txt.exe"
         );
+    }
+
+    #[test]
+    fn filesystem_root_has_no_parent_entry() {
+        let root = parent_entry(Path::new(std::path::MAIN_SEPARATOR_STR));
+        if cfg!(windows) {
+            assert!(root.is_some_and(|entry| entry.path.as_os_str().is_empty()));
+        } else {
+            assert!(root.is_none());
+        }
     }
 }

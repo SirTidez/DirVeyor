@@ -97,10 +97,12 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool) {
         Style::default().fg(Color::DarkGray)
     };
     let path_width = area.width.saturating_sub(8) as usize;
-    let title = format!(
-        " {} ",
-        truncate(&safe_text(&pane.location.to_string_lossy()), path_width)
-    );
+    let location = if pane.browsing_drives {
+        "All drives".into()
+    } else {
+        safe_text(&pane.location.to_string_lossy())
+    };
+    let title = format!(" {} ", truncate(&location, path_width));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -168,6 +170,8 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
         let cursor = if focused { ">" } else { " " };
         let check = if selected { "[x]" } else { "[ ]" };
         let kind = match entry.kind {
+            EntryKind::Parent => "↑",
+            EntryKind::Drive => "◆",
             EntryKind::Directory => "/",
             EntryKind::Symlink => "@",
             EntryKind::File => " ",
@@ -432,6 +436,8 @@ fn human_size(bytes: u64) -> String {
 
 fn kind_label(kind: EntryKind) -> &'static str {
     match kind {
+        EntryKind::Parent => "Parent directory",
+        EntryKind::Drive => "Drive",
         EntryKind::Directory => "Directory",
         EntryKind::File => "File",
         EntryKind::Symlink => "Symbolic link",
