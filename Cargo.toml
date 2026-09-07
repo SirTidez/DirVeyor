@@ -12,9 +12,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-# Keep package metadata pointed at the repository's current remote until the
-# external GitHub repository is renamed.
-repository = "https://github.com/SirTidez/FileAdmin"
+repository = "https://github.com/SirTidez/DirVeyor"
 
 [workspace.dependencies]
 crossterm = "0.29.0"
