@@ -1,4 +1,4 @@
-use fileadmin_domain::{AppState, EntryKind, LoadState, PaneId, PaneState};
+use fileadmin_domain::{AppState, DriveInfo, DriveKind, EntryKind, LoadState, PaneId, PaneState};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -178,7 +178,13 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
             EntryKind::Other => "?",
         };
         let name = pad_to_width(&truncate(&entry.display_name, name_width), name_width);
-        let size = entry.size.map(human_size).unwrap_or_else(|| "—".into());
+        let size = entry
+            .drive_info
+            .as_ref()
+            .and_then(DriveInfo::used_percent)
+            .map(|percent| format!("{percent}% used"))
+            .or_else(|| entry.size.map(human_size))
+            .unwrap_or_else(|| "—".into());
         let line = format!("{cursor}{check} {kind}{name} {size:>8}");
         let style = if focused {
             Style::default()
@@ -214,15 +220,19 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             entry.display_name.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        lines.push(Line::raw(format!("Type: {}", kind_label(entry.kind))));
-        lines.push(Line::raw(format!(
-            "Size: {}",
-            entry.size.map(human_size).unwrap_or_else(|| "—".into())
-        )));
-        lines.push(Line::raw(format!(
-            "Modified: {}",
-            modified_label(entry.modified)
-        )));
+        if let Some(drive) = &entry.drive_info {
+            append_drive_details(&mut lines, drive);
+        } else {
+            lines.push(Line::raw(format!("Type: {}", kind_label(entry.kind))));
+            lines.push(Line::raw(format!(
+                "Size: {}",
+                entry.size.map(human_size).unwrap_or_else(|| "—".into())
+            )));
+            lines.push(Line::raw(format!(
+                "Modified: {}",
+                modified_label(entry.modified)
+            )));
+        }
         if entry.metadata_incomplete {
             lines.push(Line::styled(
                 "Some metadata unavailable",
@@ -272,6 +282,66 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn append_drive_details(lines: &mut Vec<Line<'static>>, drive: &DriveInfo) {
+    lines.push(Line::raw(format!("Type: {}", drive_kind_label(drive.kind))));
+    if let Some(filesystem) = &drive.filesystem {
+        lines.push(Line::raw(format!("Filesystem: {filesystem}")));
+    }
+    lines.push(Line::raw(format!(
+        "Capacity: {}",
+        drive
+            .total_bytes
+            .map(human_size)
+            .unwrap_or_else(|| "Unavailable".into())
+    )));
+    lines.push(Line::raw(format!(
+        "Used: {}",
+        drive
+            .used_bytes()
+            .map(human_size)
+            .unwrap_or_else(|| "Unavailable".into())
+    )));
+    lines.push(Line::raw(format!(
+        "Available: {}",
+        drive
+            .available_bytes
+            .map(human_size)
+            .unwrap_or_else(|| "Unavailable".into())
+    )));
+    if let Some(percent) = drive.used_percent() {
+        lines.push(Line::styled(
+            drive_usage_bar(percent, 18),
+            Style::default().fg(if percent >= 90 {
+                Color::Red
+            } else if percent >= 75 {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            }),
+        ));
+    }
+}
+
+fn drive_usage_bar(percent: u8, width: usize) -> String {
+    let filled = (usize::from(percent) * width + 50) / 100;
+    format!(
+        "[{}{}] {percent}%",
+        "█".repeat(filled.min(width)),
+        "░".repeat(width.saturating_sub(filled))
+    )
+}
+
+fn drive_kind_label(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Fixed => "Fixed disk",
+        DriveKind::Removable => "Removable",
+        DriveKind::Network => "Network drive",
+        DriveKind::Optical => "Optical drive",
+        DriveKind::RamDisk => "RAM disk",
+        DriveKind::Unknown => "Unknown",
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -475,6 +545,7 @@ mod tests {
                 size: Some(1_024),
                 modified: None,
                 metadata_incomplete: false,
+                drive_info: None,
             }];
         }
         app
@@ -509,5 +580,58 @@ mod tests {
     #[test]
     fn safe_text_replaces_bidirectional_controls() {
         assert_eq!(safe_text("report\u{202e}fdp.exe"), "report�fdp.exe");
+    }
+
+    #[test]
+    fn drive_usage_is_calculated_and_rendered() {
+        let drive = DriveInfo {
+            kind: DriveKind::Fixed,
+            label: Some("Data".into()),
+            filesystem: Some("NTFS".into()),
+            total_bytes: Some(1_000),
+            available_bytes: Some(250),
+        };
+
+        assert_eq!(drive.used_bytes(), Some(750));
+        assert_eq!(drive.used_percent(), Some(75));
+        assert_eq!(drive_usage_bar(75, 4), "[███░] 75%");
+    }
+
+    #[test]
+    fn wide_drive_view_renders_capacity_details_in_inspector() {
+        let mut app = populated_app();
+        let pane = app.pane_mut(PaneId::Left);
+        pane.browsing_drives = true;
+        pane.entries = vec![FileEntry {
+            path: PathBuf::from("D:\\"),
+            display_name: "D:\\  Data".into(),
+            kind: EntryKind::Drive,
+            size: None,
+            modified: None,
+            metadata_incomplete: false,
+            drive_info: Some(DriveInfo {
+                kind: DriveKind::Fixed,
+                label: Some("Data".into()),
+                filesystem: Some("NTFS".into()),
+                total_bytes: Some(1_000),
+                available_bytes: Some(250),
+            }),
+        }];
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Filesystem: NTFS"));
+        assert!(screen.contains("Capacity: 1000 B"));
+        assert!(screen.contains("Available: 250 B"));
+        assert!(screen.contains("75%"));
     }
 }

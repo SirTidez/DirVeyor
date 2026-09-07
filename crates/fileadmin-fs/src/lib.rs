@@ -1,6 +1,6 @@
 //! Read-only filesystem scanning on bounded background workers.
 
-use fileadmin_domain::{EntryKind, FileEntry, PaneId};
+use fileadmin_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -204,6 +204,7 @@ pub fn scan_directory(path: &Path) -> Result<DirectoryListing, ScanError> {
             size,
             modified,
             metadata_incomplete,
+            drive_info: None,
         });
         discovered += 1;
     }
@@ -222,6 +223,7 @@ fn parent_entry(path: &Path) -> Option<FileEntry> {
             size: None,
             modified: None,
             metadata_incomplete: false,
+            drive_info: None,
         });
     }
 
@@ -237,6 +239,7 @@ fn drive_root_parent_entry() -> Option<FileEntry> {
         size: None,
         modified: None,
         metadata_incomplete: false,
+        drive_info: None,
     })
 }
 
@@ -247,26 +250,116 @@ fn drive_root_parent_entry() -> Option<FileEntry> {
 
 #[cfg(windows)]
 fn scan_drives() -> Result<DirectoryListing, ScanError> {
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    // SAFETY: GetLogicalDrives takes no pointers and has no preconditions.
+    let drive_mask = unsafe { GetLogicalDrives() };
     let entries = (b'A'..=b'Z')
-        .filter_map(|letter| {
+        .filter(|letter| drive_mask & (1 << (letter - b'A')) != 0)
+        .map(|letter| {
             let path = PathBuf::from(format!("{}:\\", letter as char));
-            path.try_exists()
-                .ok()
-                .filter(|exists| *exists)
-                .map(|_| FileEntry {
-                    display_name: path.to_string_lossy().into_owned(),
-                    path,
-                    kind: EntryKind::Drive,
-                    size: None,
-                    modified: None,
-                    metadata_incomplete: false,
-                })
+            let drive_info = windows_drive_info(&path);
+            let display_name = match drive_info.label.as_deref() {
+                Some(label) if !label.is_empty() => format!("{}  {label}", path.display()),
+                _ => path.to_string_lossy().into_owned(),
+            };
+            FileEntry {
+                display_name,
+                path,
+                kind: EntryKind::Drive,
+                size: None,
+                modified: None,
+                metadata_incomplete: drive_info.total_bytes.is_none(),
+                drive_info: Some(drive_info),
+            }
         })
         .collect();
     Ok(DirectoryListing {
         entries,
         truncated: false,
     })
+}
+
+#[cfg(windows)]
+fn windows_drive_info(path: &Path) -> DriveInfo {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+    };
+
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: wide_path is NUL-terminated and remains alive for every API call below.
+    let raw_kind = unsafe { GetDriveTypeW(wide_path.as_ptr()) };
+    let kind = match raw_kind {
+        DRIVE_FIXED => DriveKind::Fixed,
+        DRIVE_REMOVABLE => DriveKind::Removable,
+        DRIVE_REMOTE => DriveKind::Network,
+        DRIVE_CDROM => DriveKind::Optical,
+        DRIVE_RAMDISK => DriveKind::RamDisk,
+        _ => DriveKind::Unknown,
+    };
+
+    let mut available = 0_u64;
+    let mut total = 0_u64;
+    let mut total_free = 0_u64;
+    // SAFETY: each output pointer references a valid u64 for the duration of the call.
+    let space_available = unsafe {
+        GetDiskFreeSpaceExW(
+            wide_path.as_ptr(),
+            &mut available,
+            &mut total,
+            &mut total_free,
+        ) != 0
+    };
+
+    let mut label_buffer = [0_u16; 261];
+    let mut filesystem_buffer = [0_u16; 261];
+    let mut serial = 0_u32;
+    let mut max_component = 0_u32;
+    let mut flags = 0_u32;
+    // SAFETY: both buffers are writable and their exact lengths are supplied.
+    let volume_available = unsafe {
+        GetVolumeInformationW(
+            wide_path.as_ptr(),
+            label_buffer.as_mut_ptr(),
+            label_buffer.len() as u32,
+            &mut serial,
+            &mut max_component,
+            &mut flags,
+            filesystem_buffer.as_mut_ptr(),
+            filesystem_buffer.len() as u32,
+        ) != 0
+    };
+
+    let (label, filesystem) = if volume_available {
+        (
+            wide_buffer_to_string(&label_buffer),
+            wide_buffer_to_string(&filesystem_buffer),
+        )
+    } else {
+        (None, None)
+    };
+
+    DriveInfo {
+        kind,
+        label,
+        filesystem,
+        total_bytes: space_available.then_some(total),
+        available_bytes: space_available.then_some(available),
+    }
+}
+
+#[cfg(windows)]
+fn wide_buffer_to_string(buffer: &[u16]) -> Option<String> {
+    let length = buffer
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(buffer.len());
+    let value = String::from_utf16_lossy(&buffer[..length]);
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(not(windows))]
@@ -359,5 +452,19 @@ mod tests {
         } else {
             assert!(root.is_none());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_listing_reports_capacity_for_an_accessible_volume() {
+        let listing = scan_drives().unwrap();
+
+        assert!(listing.entries.iter().any(|entry| {
+            entry
+                .drive_info
+                .as_ref()
+                .and_then(|drive| drive.total_bytes)
+                .is_some_and(|total| total > 0)
+        }));
     }
 }

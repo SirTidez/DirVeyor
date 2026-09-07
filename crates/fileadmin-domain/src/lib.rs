@@ -39,6 +39,40 @@ pub enum EntryKind {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriveKind {
+    Fixed,
+    Removable,
+    Network,
+    Optical,
+    RamDisk,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriveInfo {
+    pub kind: DriveKind,
+    pub label: Option<String>,
+    pub filesystem: Option<String>,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+}
+
+impl DriveInfo {
+    pub fn used_bytes(&self) -> Option<u64> {
+        Some(self.total_bytes?.saturating_sub(self.available_bytes?))
+    }
+
+    pub fn used_percent(&self) -> Option<u8> {
+        let total = self.total_bytes?;
+        if total == 0 {
+            return None;
+        }
+        let used = self.used_bytes()?;
+        Some(((used as u128 * 100) / total as u128).min(100) as u8)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileEntry {
     pub path: PathBuf,
@@ -47,6 +81,7 @@ pub struct FileEntry {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub metadata_incomplete: bool,
+    pub drive_info: Option<DriveInfo>,
 }
 
 impl FileEntry {
@@ -345,6 +380,7 @@ mod tests {
             size: Some(size),
             modified: None,
             metadata_incomplete: false,
+            drive_info: None,
         }
     }
 

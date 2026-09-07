@@ -52,6 +52,8 @@ Read-only filesystem adapter:
 - stable error classifications and user-safe messages;
 - filename control/bidirectional-character sanitization;
 - a 50,000-entry in-memory cap with explicit truncation state.
+- Windows drive discovery plus native volume labels, filesystem types, and
+  free/total capacity metrics.
 
 The entry cap is a prototype safety bound, not the final large-directory
 strategy. Paging or a disk-backed index must replace it before million-entry

@@ -6,7 +6,9 @@ operation queue, device-aware transfer planning, and safety-focused previews.
 
 The first implemented milestone is a functional **read-only browser**. It can
 navigate two panes, select items, filter and sort entries, toggle dotfiles, and
-inspect metadata while directory work runs on bounded background workers.
+inspect metadata while directory work runs on bounded background workers. On
+Windows, the all-drives view reports volume labels, types, filesystems, capacity,
+used space, and available space.
 
 Copy, move, rename, delete, external file opening, and the operation queue are
 deliberately disabled until the planning and review model is implemented.
