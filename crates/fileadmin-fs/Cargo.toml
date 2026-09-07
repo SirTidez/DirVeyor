@@ -1,0 +1,15 @@
+[package]
+name = "fileadmin-fs"
+description = "Bounded, read-only filesystem access for FileAdmin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fileadmin-domain = { path = "../fileadmin-domain" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
