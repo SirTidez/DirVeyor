@@ -5,12 +5,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fileadmin_domain::{AppState, LoadState, PaneId, parent_or_same};
+use fileadmin_domain::{AppState, EntryKind, FolderSizeState, LoadState, PaneId, parent_or_same};
 use fileadmin_domain::{
     JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
-use fileadmin_fs::{DirectoryScanner, RequestError, ScanLocation, ScanRequest};
+use fileadmin_fs::{DirectoryScanner, FolderSizeScanner, RequestError, ScanLocation, ScanRequest};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::error::Error;
@@ -27,6 +27,7 @@ fn main() -> AppResult<()> {
     let right = parent_or_same(&current);
     let mut app = AppState::new(current, right);
     let scanner = DirectoryScanner::new();
+    let folder_sizes = FolderSizeScanner::new();
     let operations = OperationEngine::new();
     queue_initial_scans(&mut app, &scanner);
 
@@ -34,18 +35,27 @@ fn main() -> AppResult<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
 
-    run(&mut terminal, &mut app, &scanner, &operations)
+    run(
+        &mut terminal,
+        &mut app,
+        &scanner,
+        &folder_sizes,
+        &operations,
+    )
 }
 
 fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut AppState,
     scanner: &DirectoryScanner,
+    folder_sizes: &FolderSizeScanner,
     operations: &OperationEngine,
 ) -> AppResult<()> {
     while !app.should_quit {
         drain_scan_events(app, scanner);
         drain_operation_events(app, scanner, operations);
+        drain_folder_size_events(app, folder_sizes);
+        sync_folder_size(app, folder_sizes);
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if event::poll(Duration::from_millis(50))?
@@ -56,6 +66,65 @@ fn run(
         }
     }
     Ok(())
+}
+
+fn drain_folder_size_events(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
+    while let Ok(event) = folder_sizes.try_recv() {
+        let is_current = matches!(
+            &app.folder_size,
+            FolderSizeState::Loading {
+                request_id,
+                pane,
+                generation,
+                path,
+            } if *request_id == event.request_id
+                && *pane == event.pane
+                && *generation == event.generation
+                && *path == event.path
+        );
+        if !is_current {
+            continue;
+        }
+        app.folder_size = match event.result {
+            Ok(summary) => FolderSizeState::Ready(summary),
+            Err(message) => FolderSizeState::Failed {
+                request_id: event.request_id,
+                pane: event.pane,
+                generation: event.generation,
+                path: event.path,
+                message,
+            },
+        };
+    }
+}
+
+fn sync_folder_size(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
+    let pane = app.active_pane;
+    let generation = app.active().generation;
+    let path = app
+        .active()
+        .focused()
+        .filter(|entry| entry.kind == EntryKind::Directory)
+        .map(|entry| entry.path.clone());
+
+    let Some(path) = path else {
+        if !matches!(app.folder_size, FolderSizeState::Idle) {
+            folder_sizes.cancel();
+            app.folder_size = FolderSizeState::Idle;
+        }
+        return;
+    };
+    if app.folder_size.matches(pane, generation, &path) {
+        return;
+    }
+
+    let request_id = folder_sizes.request(pane, generation, path.clone());
+    app.folder_size = FolderSizeState::Loading {
+        request_id,
+        pane,
+        generation,
+        path,
+    };
 }
 
 fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner) {

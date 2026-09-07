@@ -1,6 +1,6 @@
 use fileadmin_domain::{
-    AppState, DriveInfo, DriveKind, EntryKind, JobOutcome, JobPhase, LoadState, OperationKind,
-    OperationView, PaneId, PaneState, PlanSummary, TextAction, TextPrompt,
+    AppState, DriveInfo, DriveKind, EntryKind, FolderSizeState, JobOutcome, JobPhase, LoadState,
+    OperationKind, OperationView, PaneId, PaneState, PlanSummary, TextAction, TextPrompt,
 };
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -245,10 +245,14 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             append_drive_details(&mut lines, drive);
         } else {
             lines.push(Line::raw(format!("Type: {}", kind_label(entry.kind))));
-            lines.push(Line::raw(format!(
-                "Size: {}",
-                entry.size.map(human_size).unwrap_or_else(|| "—".into())
-            )));
+            if entry.kind == EntryKind::Directory {
+                append_folder_size_details(&mut lines, &app.folder_size, &entry.path);
+            } else {
+                lines.push(Line::raw(format!(
+                    "Size: {}",
+                    entry.size.map(human_size).unwrap_or_else(|| "—".into())
+                )));
+            }
             lines.push(Line::raw(format!(
                 "Modified: {}",
                 modified_label(entry.modified)
@@ -304,6 +308,78 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn append_folder_size_details(
+    lines: &mut Vec<Line<'static>>,
+    state: &FolderSizeState,
+    focused_path: &std::path::Path,
+) {
+    match state {
+        FolderSizeState::Loading { path, .. } if path == focused_path => {
+            lines.push(Line::styled(
+                "Contained size: Calculating…",
+                Style::default().fg(Color::Cyan),
+            ));
+            lines.push(Line::raw("Drive share: Calculating…"));
+        }
+        FolderSizeState::Ready(summary) if summary.path == focused_path => {
+            lines.push(Line::raw(format!(
+                "Contained size: {}",
+                human_size(summary.total_bytes)
+            )));
+            lines.push(Line::raw(format!(
+                "Drive share: {}",
+                drive_share_label(summary.total_bytes, summary.drive_total_bytes)
+            )));
+            lines.push(Line::raw(format!(
+                "Contents: {} files · {} folders",
+                summary.file_count,
+                summary.directory_count.saturating_sub(1)
+            )));
+            if summary.skipped_items > 0 {
+                lines.push(Line::styled(
+                    format!("{} inaccessible/link items skipped", summary.skipped_items),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+        FolderSizeState::Failed { path, message, .. } if path == focused_path => {
+            lines.push(Line::styled(
+                "Contained size: Unavailable",
+                Style::default().fg(Color::Yellow),
+            ));
+            lines.push(Line::styled(
+                safe_text(message),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        _ => {
+            lines.push(Line::styled(
+                "Contained size: Waiting…",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::raw("Drive share: Waiting…"));
+        }
+    }
+}
+
+fn drive_share_label(folder_bytes: u64, drive_total_bytes: Option<u64>) -> String {
+    let Some(drive_total_bytes) = drive_total_bytes.filter(|total| *total > 0) else {
+        return "Unavailable".into();
+    };
+    if folder_bytes == 0 {
+        return format!("0% of {}", human_size(drive_total_bytes));
+    }
+    let percent = folder_bytes as f64 * 100.0 / drive_total_bytes as f64;
+    let percentage = if percent < 0.001 {
+        "<0.001%".into()
+    } else if percent < 1.0 {
+        format!("{percent:.3}%")
+    } else {
+        format!("{percent:.2}%")
+    };
+    format!("{percentage} of {}", human_size(drive_total_bytes))
 }
 
 fn append_drive_details(lines: &mut Vec<Line<'static>>, drive: &DriveInfo) {
@@ -1064,7 +1140,7 @@ mod tests {
             warnings: vec!["Sources remain until verification succeeds".into()],
         });
 
-        let screen = rendered_screen(&app, 120, 30);
+        let screen = rendered_screen(&app, 160, 35);
         assert!(screen.contains("Review move"));
         assert!(screen.contains("Destination: right"));
         assert!(screen.contains("Enter Execute move"));
@@ -1107,5 +1183,46 @@ mod tests {
         assert!(screen.contains("Rename"));
         assert!(screen.contains("renamed.txt"));
         assert!(screen.contains("Esc Cancel"));
+    }
+
+    #[test]
+    fn focused_folder_renders_contained_size_and_drive_share() {
+        let mut app = populated_app();
+        let folder_path = PathBuf::from("left").join("folder");
+        app.pane_mut(PaneId::Left).entries = vec![FileEntry {
+            path: folder_path.clone(),
+            display_name: "folder".into(),
+            kind: EntryKind::Directory,
+            size: None,
+            modified: None,
+            metadata_incomplete: false,
+            drive_info: None,
+        }];
+        app.folder_size = FolderSizeState::Ready(fileadmin_domain::FolderSizeSummary {
+            request_id: 3,
+            pane: PaneId::Left,
+            generation: 0,
+            path: folder_path,
+            total_bytes: 250_000_000,
+            file_count: 42,
+            directory_count: 5,
+            skipped_items: 0,
+            drive_total_bytes: Some(1_000_000_000),
+        });
+
+        let screen = rendered_screen(&app, 160, 35);
+        assert!(screen.contains("Contained size: 238 MB"));
+        assert!(screen.contains("Drive share: 25.00% of 954 MB"));
+        assert!(screen.contains("Contents: 42 files · 4 folders"));
+    }
+
+    #[test]
+    fn tiny_folder_drive_share_remains_visible() {
+        assert_eq!(
+            drive_share_label(1, Some(1_000_000_000)),
+            "<0.001% of 954 MB"
+        );
+        assert_eq!(drive_share_label(0, Some(1_024)), "0% of 1.0 KB");
+        assert_eq!(drive_share_label(1, None), "Unavailable");
     }
 }
