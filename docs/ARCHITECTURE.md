@@ -146,9 +146,12 @@ Windows hidden attributes are not yet considered.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
    Permanent deletion additionally requires typing `DELETE`.
 4. The executor revalidates source identity, performs the planned strategy, and
-   reports bounded progress. Permanent delete removes manifest files one at a
-   time and directories deepest-first, exposing completed bytes and separate
-   file/folder counts. Cancellation stops before the next safe step.
+   reports bounded progress. Transfer discovery feeds a bounded queue while one
+   same-volume or two cross-volume workers copy independent files. A conflict
+   pauses the discovery producer, but workers can finish already queued files.
+   Permanent delete removes manifest files one at a time and directories
+   deepest-first, exposing completed bytes and separate file/folder counts.
+   Cancellation stops before the next safe step.
 5. The UI displays a durable outcome and refreshes affected visible panes.
 
 ## Safety properties already enforced
@@ -156,7 +159,9 @@ Windows hidden attributes are not yet considered.
 - The directory-scanning crate remains read-only; mutations are isolated in the
   operation engine.
 - No operation executes before explicit plan approval.
-- Existing destinations are not overwritten.
+- Existing destinations are not overwritten without an explicit conflict
+  choice (or a matching Apply-to-all policy), and the chosen destination is
+  revalidated before replacement.
 - Failed Recycle Bin / Trash operations never fall back to permanent deletion.
 - Permanent deletion is a separate, visibly red mode selected with `Ctrl+D`;
   directory failures may be partial and are reported as such.
@@ -165,7 +170,8 @@ Windows hidden attributes are not yet considered.
   cleanup revalidates every journal entry before removal.
 - Sources are revalidated after review before mutation.
 - Directory work runs outside the rendering/input loop.
-- Queues and directory snapshots are bounded.
+- Transfer queues and directory snapshots are bounded; a large tree does not
+  become an in-memory file manifest.
 - Stale results cannot replace current pane state.
 - Filesystem roots have harmless parent navigation.
 - Filenames and paths cannot inject terminal control or bidirectional controls.

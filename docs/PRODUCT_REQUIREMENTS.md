@@ -222,6 +222,12 @@ The scheduler should model resources, not merely spawn one task per file.
   rereads or starve interactive work.
 - Apply backpressure from destination writes to source reads.
 
+Current baseline implementation uses one file worker when all sources and the
+destination share a volume, and up to two workers for cross-volume transfers.
+The discovery producer is separate and feeds only eight queued files per worker.
+This is deliberately conservative until reliable medium detection and measured
+adaptive scheduling are implemented.
+
 No device class guarantees an optimal fixed worker count. The implementation
 must benchmark representative workloads and expose enough telemetry in debug
 mode to tune the policy.
