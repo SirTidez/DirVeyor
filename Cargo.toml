@@ -2,6 +2,7 @@
 members = [
     "crates/fileadmin-app",
     "crates/fileadmin-domain",
+    "crates/fileadmin-engine",
     "crates/fileadmin-fs",
 ]
 resolver = "3"
@@ -15,7 +16,10 @@ repository = "https://github.com/SirTidez/FileAdmin"
 
 [workspace.dependencies]
 crossterm = "0.29.0"
+crossbeam-channel = "0.5.17"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "crossterm_0_29"] }
+sha2 = "0.11.0"
 tempfile = "3.27.0"
+trash = { version = "5.2.7", default-features = false, features = ["coinit_multithreaded"] }
 unicode-width = "0.2.2"
 windows-sys = "0.61.2"

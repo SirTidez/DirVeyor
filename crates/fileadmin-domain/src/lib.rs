@@ -1,5 +1,9 @@
 //! Pure state used by the FileAdmin UI and filesystem adapters.
 
+mod operation;
+
+pub use operation::*;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -322,6 +326,8 @@ pub struct AppState {
     pub filter_mode: bool,
     pub notice: Option<String>,
     pub should_quit: bool,
+    pub operation: OperationView,
+    pub text_prompt: Option<TextPrompt>,
 }
 
 impl AppState {
@@ -333,6 +339,8 @@ impl AppState {
             filter_mode: false,
             notice: Some("Read-only prototype: filesystem changes are disabled".into()),
             should_quit: false,
+            operation: OperationView::Idle,
+            text_prompt: None,
         }
     }
 
@@ -358,6 +366,21 @@ impl AppState {
 
     pub fn selected_count(&self) -> usize {
         self.panes.iter().map(|pane| pane.selected.len()).sum()
+    }
+
+    pub fn operation_sources(&self) -> Vec<PathBuf> {
+        let pane = self.active();
+        if pane.selected.is_empty() {
+            return pane
+                .focused()
+                .filter(|entry| !entry.is_parent() && !entry.is_drive())
+                .map(|entry| vec![entry.path.clone()])
+                .unwrap_or_default();
+        }
+
+        let mut sources: Vec<_> = pane.selected.iter().cloned().collect();
+        sources.sort();
+        sources
     }
 }
 
