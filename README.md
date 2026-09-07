@@ -38,6 +38,51 @@ destinations are never overwritten: copy and move conflicts receive numbered
 uses the operating-system Recycle Bin or Trash and never falls back to permanent
 deletion.
 
+## Interface tour
+
+These captures are rendered from FileAdmin's actual Ratatui interface at
+140×38 terminal cells.
+
+### Drive-first browsing
+
+Both panes open on All drives, with the User folder and Favorites kept separate
+from physical volumes. Focusing a drive exposes its type, filesystem, capacity,
+usage, available space, and a graphical usage bar.
+
+![Two FileAdmin panes showing user-folder shortcuts, Favorites, drive usage, and the drive inspector](docs/images/all-drives.png)
+
+### Favorites
+
+`Ctrl+F` opens the dedicated Favorites panel over the current browser state.
+Saved folders can be opened in the active pane or removed directly from this
+panel.
+
+![FileAdmin Favorites panel listing two saved folders](docs/images/favorites.png)
+
+### Folder inspection
+
+Focusing a directory starts background analysis without blocking navigation.
+The inspector reports contained size, drive share, and discovered file and
+folder counts.
+
+![FileAdmin browsing two folders while the inspector displays a focused directory's contained size and drive share](docs/images/folder-inspector.png)
+
+### Full-screen text preview
+
+Preview temporarily replaces the browser. This Markdown example shows raw text
+and its rendered representation side by side; other modes include JSON Pretty,
+logs, configuration files, source code, and plain text.
+
+![FileAdmin full-screen Markdown preview showing raw and rendered content side by side](docs/images/markdown-preview.png)
+
+### Reviewed filesystem operations
+
+Copy, move, recycle, rename, and folder creation do not mutate the filesystem
+immediately. FileAdmin first presents the frozen plan, destination, strategy,
+item totals, and warnings for explicit approval.
+
+![FileAdmin copy review showing source, destination, totals, safety warnings, and execution controls](docs/images/operation-review.png)
+
 ## Run
 
 Requirements: Rust 1.88 or newer and a terminal at least 80×24.
