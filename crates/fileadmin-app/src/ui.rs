@@ -554,7 +554,7 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool) {
                 Line::raw(safe_text(message)),
                 Line::raw(""),
                 Line::styled(
-                    "Enter Retry · Backspace Parent",
+                    "Enter Retry · ←/Backspace Parent",
                     Style::default().fg(Color::Cyan),
                 ),
             ];
@@ -699,12 +699,13 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             Line::raw(format!("Loaded: {} items", pane.entries.len()))
         },
         Line::raw(""),
+        Line::styled("← Back · → Open/select", Style::default().fg(Color::Cyan)),
         Line::styled(
             "p Preview · c Copy · m Move",
             Style::default().fg(Color::Cyan),
         ),
         Line::styled(
-            "d Recycle · r Rename · n New folder",
+            "d Recycle · r Rename · n Folder",
             Style::default().fg(Color::Cyan),
         ),
     ]);
@@ -883,9 +884,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             app.active().filter
         )
     } else if area.width >= 110 {
-        " Tab Pane  ↑↓ Navigate  Enter Open  p Preview  c Copy  m Move  d Recycle  r Rename  n Folder  F1 Help".into()
+        " Tab Pane  ↑↓ Move  ← Back  → Open/Select  Enter Open/Preview  c Copy  m Move  d Recycle  F1 Help".into()
     } else {
-        " Tab Pane  ↑↓ Move  Enter Open  p Preview  c Copy  m Move  d Recycle  F1 Help".into()
+        " ↑↓ Move  ← Back  → Open/Select  Enter Open  p Preview  F1 Help".into()
     };
     frame.render_widget(
         Paragraph::new(truncate(&text, area.width as usize))
@@ -895,7 +896,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(72, 78, area);
+    let popup = centered_rect(72, 92, area);
     let lines = vec![
         Line::styled(
             "FileAdmin controls",
@@ -903,22 +904,19 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::raw(""),
         Line::raw("Tab / Shift+Tab   Switch pane"),
         Line::raw("↑ ↓ or j k         Move focus"),
-        Line::raw("Home / End         First / last visible item"),
+        Line::raw("← / Backspace      Parent folder"),
+        Line::raw("→                   Open folder / toggle file selection"),
+        Line::raw("Home / End         First / last item"),
         Line::raw("Space              Toggle selection"),
         Line::raw("Enter              Open folder or preview file"),
         Line::raw("p                   Preview focused text file"),
-        Line::raw("Backspace          Parent folder"),
         Line::raw("/                  Filter active pane"),
-        Line::raw("h                  Toggle dotfiles"),
-        Line::raw("s                  Cycle sort field"),
-        Line::raw("c                  Plan copy to other pane"),
-        Line::raw("m                  Plan move to other pane"),
+        Line::raw("h / s              Toggle dotfiles / cycle sort"),
+        Line::raw("c / m              Plan copy / move to other pane"),
         Line::raw("d / Delete         Plan move to Recycle Bin / Trash"),
-        Line::raw("r / F2             Rename focused item"),
-        Line::raw("n                  Create a folder in the active pane"),
+        Line::raw("r / F2 / n         Rename item / create folder"),
         Line::raw("q / Ctrl+C         Quit"),
         Line::raw(""),
         Line::styled(
@@ -1519,6 +1517,19 @@ mod tests {
             let app = populated_app();
             terminal.draw(|frame| render(frame, &app)).unwrap();
         }
+    }
+
+    #[test]
+    fn browse_footer_and_help_advertise_spatial_navigation() {
+        let mut app = populated_app();
+        let footer = rendered_screen(&app, 120, 30);
+        assert!(footer.contains("← Back"));
+        assert!(footer.contains("→ Open/Select"));
+
+        app.help_visible = true;
+        let help = rendered_screen(&app, 80, 24);
+        assert!(help.contains("← / Backspace"));
+        assert!(help.contains("→                   Open folder"));
     }
 
     #[test]

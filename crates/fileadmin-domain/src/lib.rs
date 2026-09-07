@@ -212,6 +212,7 @@ pub struct PaneState {
     pub generation: u64,
     pub truncated: bool,
     pub browsing_drives: bool,
+    focus_after_load: Option<PathBuf>,
 }
 
 impl PaneState {
@@ -228,10 +229,19 @@ impl PaneState {
             generation: 0,
             truncated: false,
             browsing_drives: false,
+            focus_after_load: None,
         }
     }
 
     pub fn begin_load(&mut self, location: PathBuf) -> u64 {
+        self.begin_load_restoring_focus(location, None)
+    }
+
+    pub fn begin_load_restoring_focus(
+        &mut self,
+        location: PathBuf,
+        focus_after_load: Option<PathBuf>,
+    ) -> u64 {
         self.location = location;
         self.entries.clear();
         self.cursor = 0;
@@ -239,11 +249,16 @@ impl PaneState {
         self.load_state = LoadState::Loading;
         self.truncated = false;
         self.browsing_drives = false;
+        self.focus_after_load = focus_after_load;
         self.generation = self.generation.wrapping_add(1);
         self.generation
     }
 
     pub fn begin_drive_list(&mut self) -> u64 {
+        self.begin_drive_list_restoring_focus(None)
+    }
+
+    pub fn begin_drive_list_restoring_focus(&mut self, focus_after_load: Option<PathBuf>) -> u64 {
         self.location = PathBuf::new();
         self.entries.clear();
         self.cursor = 0;
@@ -251,8 +266,18 @@ impl PaneState {
         self.load_state = LoadState::Loading;
         self.truncated = false;
         self.browsing_drives = true;
+        self.focus_after_load = focus_after_load;
         self.generation = self.generation.wrapping_add(1);
         self.generation
+    }
+
+    pub fn retry_load(&mut self) -> u64 {
+        let focus_after_load = self.focus_after_load.take();
+        if self.browsing_drives {
+            self.begin_drive_list_restoring_focus(focus_after_load)
+        } else {
+            self.begin_load_restoring_focus(self.location.clone(), focus_after_load)
+        }
     }
 
     /// Applies a result only if it belongs to the latest request.
@@ -262,9 +287,14 @@ impl PaneState {
         }
         self.entries = entries;
         self.sort_entries();
-        self.cursor = self.cursor.min(self.visible_len().saturating_sub(1));
+        if let Some(target) = self.focus_after_load.take() {
+            self.restore_focus(&target);
+        } else {
+            self.cursor = self.cursor.min(self.visible_len().saturating_sub(1));
+        }
         self.load_state = LoadState::Ready;
         self.truncated = false;
+        self.focus_after_load = None;
         true
     }
 
@@ -336,7 +366,7 @@ impl PaneState {
             && let Some(position) = self
                 .visible_indices()
                 .iter()
-                .position(|&index| self.entries[index].path == path)
+                .position(|&index| paths_match(&self.entries[index].path, &path))
         {
             self.cursor = position;
         }
@@ -374,6 +404,38 @@ impl PaneState {
                 .then_with(|| a.path.cmp(&b.path))
         });
     }
+
+    fn restore_focus(&mut self, target: &Path) {
+        let target_exists = self
+            .entries
+            .iter()
+            .any(|entry| paths_match(&entry.path, target));
+        let mut position = self.visible_indices().iter().position(|&index| {
+            self.entries
+                .get(index)
+                .is_some_and(|entry| paths_match(&entry.path, target))
+        });
+        if position.is_none() && target_exists && !self.filter.is_empty() {
+            self.filter.clear();
+            position = self.visible_indices().iter().position(|&index| {
+                self.entries
+                    .get(index)
+                    .is_some_and(|entry| paths_match(&entry.path, target))
+            });
+        }
+        self.cursor = position.unwrap_or(0);
+    }
+}
+
+#[cfg(windows)]
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left == right
 }
 
 fn is_dot_hidden(name: &str) -> bool {
@@ -570,5 +632,96 @@ mod tests {
         pane.set_filter("does-not-match".into());
         assert_eq!(pane.visible_len(), 1);
         assert!(pane.focused().unwrap().is_parent());
+    }
+
+    #[test]
+    fn returning_to_a_parent_restores_focus_by_path_after_sorting() {
+        let root = PathBuf::from("root");
+        let child = root.join("beta");
+        let mut pane = PaneState::new(child.clone());
+        let generation = pane.begin_load_restoring_focus(root.clone(), Some(child.clone()));
+
+        pane.apply_entries(
+            generation,
+            vec![
+                FileEntry {
+                    path: root.join("alpha"),
+                    display_name: "alpha".into(),
+                    kind: EntryKind::Directory,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+                FileEntry {
+                    path: child,
+                    display_name: "beta".into(),
+                    kind: EntryKind::Directory,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+            ],
+        );
+
+        assert_eq!(pane.focused().unwrap().display_name, "beta");
+    }
+
+    #[test]
+    fn failed_parent_scan_keeps_the_focus_target_for_retry() {
+        let root = PathBuf::from("root");
+        let child = root.join("child");
+        let mut pane = PaneState::new(child.clone());
+        let failed_generation = pane.begin_load_restoring_focus(root.clone(), Some(child.clone()));
+        pane.apply_error(failed_generation, "temporary failure".into());
+
+        let retry_generation = pane.retry_load();
+        pane.apply_entries(
+            retry_generation,
+            vec![FileEntry {
+                path: child,
+                display_name: "child".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
+
+        assert_eq!(pane.focused().unwrap().display_name, "child");
+    }
+
+    #[test]
+    fn returning_to_the_drive_list_restores_the_departed_drive() {
+        let departed = PathBuf::from("D:\\");
+        let mut pane = PaneState::new(departed.clone());
+        let generation = pane.begin_drive_list_restoring_focus(Some(departed));
+        pane.apply_entries(
+            generation,
+            vec![
+                FileEntry {
+                    path: PathBuf::from("C:\\"),
+                    display_name: "C:\\".into(),
+                    kind: EntryKind::Drive,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+                FileEntry {
+                    path: PathBuf::from("D:\\"),
+                    display_name: "D:\\".into(),
+                    kind: EntryKind::Drive,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+            ],
+        );
+
+        assert_eq!(pane.focused().unwrap().display_name, "D:\\");
     }
 }

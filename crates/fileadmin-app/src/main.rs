@@ -250,7 +250,8 @@ fn handle_key(
         }
         KeyCode::Char(' ') => app.active_mut().toggle_focused_selection(),
         KeyCode::Enter => open_focused_or_retry(app, scanner, previews),
-        KeyCode::Backspace => navigate_parent(app, scanner),
+        KeyCode::Right => open_or_select_focused(app, scanner, previews),
+        KeyCode::Left | KeyCode::Backspace => navigate_parent(app, scanner),
         KeyCode::Char('/') => {
             app.filter_mode = true;
             app.notice = Some("Type to filter this pane; Enter or Esc closes the filter".into());
@@ -509,7 +510,10 @@ fn refresh_affected_panes(app: &mut AppState, scanner: &DirectoryScanner, affect
         }
         if affected.iter().any(|path| path == &pane.location) {
             let target = pane.location.clone();
-            let generation = app.pane_mut(pane_id).begin_load(target.clone());
+            let focus = pane.focused().map(|entry| entry.path.clone());
+            let generation = app
+                .pane_mut(pane_id)
+                .begin_load_restoring_focus(target.clone(), focus);
             let _ = scanner.request(ScanRequest {
                 pane: pane_id,
                 generation,
@@ -545,12 +549,19 @@ fn outcome_label(outcome: JobOutcome) -> &'static str {
 }
 
 fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner, previews: &PreviewLoader) {
+    if app
+        .active()
+        .focused()
+        .is_some_and(|entry| entry.is_parent())
+    {
+        navigate_parent(app, scanner);
+        return;
+    }
     let target = match &app.active().load_state {
-        LoadState::Failed(_) if app.active().browsing_drives => {
-            navigate_to_drives(app, scanner);
+        LoadState::Failed(_) => {
+            retry_active_location(app, scanner);
             return;
         }
-        LoadState::Failed(_) => Some(app.active().location.clone()),
         _ => app
             .active()
             .focused()
@@ -559,19 +570,24 @@ fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner, preview
     };
 
     if let Some(target) = target {
-        if target.as_os_str().is_empty()
-            && app
-                .active()
-                .focused()
-                .is_some_and(|entry| entry.is_parent())
-        {
-            navigate_to_drives(app, scanner);
-        } else {
-            navigate_to(app, scanner, target);
-        }
+        navigate_to(app, scanner, target);
     } else if let Some(entry) = app.active().focused() {
         let path = entry.path.clone();
         begin_preview_path(app, previews, path);
+    }
+}
+
+fn open_or_select_focused(
+    app: &mut AppState,
+    scanner: &DirectoryScanner,
+    previews: &PreviewLoader,
+) {
+    match app.active().focused().map(|entry| entry.kind) {
+        Some(EntryKind::Parent | EntryKind::Drive | EntryKind::Directory) => {
+            open_focused_or_retry(app, scanner, previews)
+        }
+        Some(EntryKind::File) => app.active_mut().toggle_focused_selection(),
+        _ => {}
     }
 }
 
@@ -1040,8 +1056,19 @@ fn jump_to_current_match(session: &mut PreviewSession) {
 }
 
 fn navigate_to(app: &mut AppState, scanner: &DirectoryScanner, target: PathBuf) {
+    navigate_to_restoring_focus(app, scanner, target, None);
+}
+
+fn navigate_to_restoring_focus(
+    app: &mut AppState,
+    scanner: &DirectoryScanner,
+    target: PathBuf,
+    focus_after_load: Option<PathBuf>,
+) {
     let pane_id = app.active_pane;
-    let generation = app.active_mut().begin_load(target.clone());
+    let generation = app
+        .active_mut()
+        .begin_load_restoring_focus(target.clone(), focus_after_load);
     let request = ScanRequest {
         pane: pane_id,
         generation,
@@ -1062,23 +1089,49 @@ fn navigate_parent(app: &mut AppState, scanner: &DirectoryScanner) {
     let parent = parent_or_same(&current);
     if parent == current {
         #[cfg(windows)]
-        navigate_to_drives(app, scanner);
+        navigate_to_drives_restoring_focus(app, scanner, Some(current));
         #[cfg(not(windows))]
         {
             app.notice = Some("Already at the filesystem root".into());
         }
     } else {
-        navigate_to(app, scanner, parent);
+        navigate_to_restoring_focus(app, scanner, parent, Some(current));
     }
 }
 
-fn navigate_to_drives(app: &mut AppState, scanner: &DirectoryScanner) {
+fn navigate_to_drives_restoring_focus(
+    app: &mut AppState,
+    scanner: &DirectoryScanner,
+    focus_after_load: Option<PathBuf>,
+) {
     let pane_id = app.active_pane;
-    let generation = app.active_mut().begin_drive_list();
+    let generation = app
+        .active_mut()
+        .begin_drive_list_restoring_focus(focus_after_load);
     let request = ScanRequest {
         pane: pane_id,
         generation,
         location: ScanLocation::Drives,
+    };
+    if let Err(error) = scanner.request(request) {
+        app.active_mut()
+            .apply_error(generation, request_error_message(error));
+    }
+}
+
+fn retry_active_location(app: &mut AppState, scanner: &DirectoryScanner) {
+    let pane_id = app.active_pane;
+    let browsing_drives = app.active().browsing_drives;
+    let location = app.active().location.clone();
+    let generation = app.active_mut().retry_load();
+    let request = ScanRequest {
+        pane: pane_id,
+        generation,
+        location: if browsing_drives {
+            ScanLocation::Drives
+        } else {
+            ScanLocation::Directory(location)
+        },
     };
     if let Err(error) = scanner.request(request) {
         app.active_mut()
@@ -1315,5 +1368,99 @@ mod preview_tests {
         assert!(loaded.search.case_sensitive);
         assert!(loaded.wrap);
         assert_eq!(loaded.search.matches.len(), 1);
+    }
+
+    #[test]
+    fn right_arrow_toggles_the_focused_file_selection() {
+        let scanner = DirectoryScanner::new();
+        let previews = PreviewLoader::new();
+        let operations = OperationEngine::new();
+        let mut app = app_with_focused_file();
+        let path = app.active().focused().unwrap().path.clone();
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert!(app.active().selected.contains(&path));
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert!(!app.active().selected.contains(&path));
+    }
+
+    #[test]
+    fn right_enters_a_directory_and_left_returns_focused_on_it() {
+        let scanner = DirectoryScanner::new();
+        let previews = PreviewLoader::new();
+        let operations = OperationEngine::new();
+        let root = PathBuf::from("browse-root");
+        let child = root.join("child");
+        let mut app = AppState::new(root.clone(), root.clone());
+        app.active_mut().apply_entries(
+            0,
+            vec![FileEntry {
+                path: child.clone(),
+                display_name: "child".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(app.active().location, child);
+        let child_generation = app.active().generation;
+        app.active_mut().apply_entries(child_generation, Vec::new());
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+        assert_eq!(app.active().location, root);
+        let parent_generation = app.active().generation;
+        app.active_mut().apply_entries(
+            parent_generation,
+            vec![
+                FileEntry {
+                    path: root.join("alpha"),
+                    display_name: "alpha".into(),
+                    kind: EntryKind::Directory,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+                FileEntry {
+                    path: child,
+                    display_name: "child".into(),
+                    kind: EntryKind::Directory,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+            ],
+        );
+        assert_eq!(app.active().focused().unwrap().display_name, "child");
     }
 }
