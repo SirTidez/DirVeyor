@@ -1,5 +1,6 @@
 use fileadmin_domain::{
-    ConflictSummary, JobId, OperationIntent, OperationKind, PlanSummary, PlannedStrategy,
+    ConflictSummary, JobId, OperationIntent, OperationKind, OperationPlanningProgress, PlanSummary,
+    PlannedStrategy,
 };
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
@@ -60,7 +61,7 @@ pub(crate) enum PlannedAction {
         sources: Vec<(PathBuf, Fingerprint, u64)>,
     },
     PermanentDelete {
-        sources: Vec<(PathBuf, Fingerprint)>,
+        roots: Vec<TransferRoot>,
     },
     Rename {
         source: PathBuf,
@@ -79,25 +80,64 @@ pub(crate) struct OperationPlan {
     pub affected_directories: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_plan(
     job: JobId,
     intent: OperationIntent,
     cancelled: &AtomicBool,
 ) -> Result<OperationPlan, String> {
+    build_plan_with_progress(job, intent, cancelled, &mut |_| {})
+}
+
+pub(crate) fn build_plan_with_progress(
+    job: JobId,
+    intent: OperationIntent,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
+) -> Result<OperationPlan, String> {
     check_cancelled(cancelled)?;
+    let kind = intent.kind();
     match intent {
         OperationIntent::Copy {
             sources,
             destination,
-        } => build_transfer(job, OperationKind::Copy, sources, destination, cancelled),
+        } => build_transfer(
+            job,
+            OperationKind::Copy,
+            sources,
+            destination,
+            cancelled,
+            progress,
+        ),
         OperationIntent::Move {
             sources,
             destination,
-        } => build_transfer(job, OperationKind::Move, sources, destination, cancelled),
-        OperationIntent::Recycle { sources } => build_delete(job, sources, false, cancelled),
-        OperationIntent::PermanentDelete { sources } => build_delete(job, sources, true, cancelled),
+        } => build_transfer(
+            job,
+            OperationKind::Move,
+            sources,
+            destination,
+            cancelled,
+            progress,
+        ),
+        OperationIntent::Recycle { sources } => {
+            build_delete(job, sources, false, cancelled, progress)
+        }
+        OperationIntent::PermanentDelete { sources } => {
+            build_delete(job, sources, true, cancelled, progress)
+        }
         OperationIntent::Rename { source, new_name } => {
-            build_rename(job, source, new_name, cancelled)
+            let result = build_rename(job, source, new_name, cancelled);
+            progress(OperationPlanningProgress {
+                job,
+                kind,
+                discovered_items: u64::from(result.is_ok()),
+                discovered_files: 0,
+                discovered_directories: 0,
+                discovered_bytes: 0,
+                current_path: None,
+            });
+            result
         }
         OperationIntent::CreateDirectory { parent, name } => {
             build_mkdir(job, parent, name, cancelled)
@@ -111,6 +151,7 @@ fn build_transfer(
     sources: Vec<PathBuf>,
     destination: PathBuf,
     cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
 ) -> Result<OperationPlan, String> {
     check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
@@ -169,6 +210,8 @@ fn build_transfer(
             files: Vec::new(),
         };
         collect_tree(
+            job,
+            kind,
             source,
             &target,
             &mut root.directories,
@@ -177,6 +220,7 @@ fn build_transfer(
             &mut file_count,
             &mut total_bytes,
             cancelled,
+            progress,
         )?;
         all_same_volume &= same_volume(source, &destination)?;
         if let Some(parent) = source.parent() {
@@ -231,6 +275,7 @@ fn build_transfer(
             strategy,
             item_count,
             file_count,
+            directory_count: item_count.saturating_sub(file_count),
             total_bytes,
             recursive_scope_known: true,
             conflicts,
@@ -246,10 +291,12 @@ fn build_delete(
     sources: Vec<PathBuf>,
     permanent: bool,
     cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
 ) -> Result<OperationPlan, String> {
     check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
     let mut snapshots = Vec::with_capacity(sources.len());
+    let mut delete_roots = Vec::with_capacity(sources.len());
     let mut item_count = 0_u64;
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
@@ -263,16 +310,49 @@ fn build_delete(
             .map_err(|error| format!("Cannot inspect source {}: {error}", source.display()))?;
         reject_link_or_special(source, &metadata)?;
         let source_fingerprint = fingerprint(&metadata)?;
-        item_count += 1;
-        if source_fingerprint.kind == ObjectKind::File {
-            file_count += 1;
-            total_bytes = total_bytes
-                .checked_add(source_fingerprint.len)
-                .ok_or_else(|| "Operation byte count overflowed".to_string())?;
+        if permanent {
+            let mut root = TransferRoot {
+                source: source.clone(),
+                target: source.clone(),
+                source_fingerprint,
+                directories: Vec::new(),
+                files: Vec::new(),
+            };
+            collect_tree(
+                job,
+                OperationKind::PermanentDelete,
+                source,
+                source,
+                &mut root.directories,
+                &mut root.files,
+                &mut item_count,
+                &mut file_count,
+                &mut total_bytes,
+                cancelled,
+                progress,
+            )?;
+            delete_roots.push(root);
         } else {
-            recursive_scope_known = false;
+            item_count += 1;
+            if source_fingerprint.kind == ObjectKind::File {
+                file_count += 1;
+                total_bytes = total_bytes
+                    .checked_add(source_fingerprint.len)
+                    .ok_or_else(|| "Operation byte count overflowed".to_string())?;
+            } else {
+                recursive_scope_known = false;
+            }
+            snapshots.push((source.clone(), source_fingerprint));
+            progress(OperationPlanningProgress {
+                job,
+                kind: OperationKind::Recycle,
+                discovered_items: item_count,
+                discovered_files: file_count,
+                discovered_directories: item_count.saturating_sub(file_count),
+                discovered_bytes: total_bytes,
+                current_path: Some(source.clone()),
+            });
         }
-        snapshots.push((source.clone(), source_fingerprint));
         if let Some(parent) = source.parent() {
             affected.push(parent.to_path_buf());
         }
@@ -291,19 +371,10 @@ fn build_delete(
         PlannedStrategy::RecycleBin
     };
     let warnings = if permanent {
-        let mut warnings =
-            vec!["This operation cannot be undone and does not use the Recycle Bin / Trash".into()];
-        if !recursive_scope_known {
-            warnings.push(
-                "Directory contents are delegated to the operating system without pre-enumeration"
-                    .into(),
-            );
-            warnings.push(
-                "A directory error can occur after some descendants have already been removed"
-                    .into(),
-            );
-        }
-        warnings
+        vec![
+            "This operation cannot be undone and does not use the Recycle Bin / Trash".into(),
+            "The reviewed file and folder manifest is removed entry by entry".into(),
+        ]
     } else {
         let mut warnings = vec![
             "Recycle support depends on the operating system and source location".into(),
@@ -318,7 +389,9 @@ fn build_delete(
         warnings
     };
     let action = if permanent {
-        PlannedAction::PermanentDelete { sources: snapshots }
+        PlannedAction::PermanentDelete {
+            roots: delete_roots,
+        }
     } else {
         PlannedAction::Recycle {
             sources: snapshots
@@ -337,6 +410,7 @@ fn build_delete(
             strategy,
             item_count,
             file_count,
+            directory_count: item_count.saturating_sub(file_count),
             total_bytes,
             recursive_scope_known,
             conflicts: Vec::new(),
@@ -384,6 +458,7 @@ fn build_rename(
             strategy: PlannedStrategy::AtomicRename,
             item_count: 1,
             file_count: u64::from(source_fingerprint.kind == ObjectKind::File),
+            directory_count: u64::from(source_fingerprint.kind == ObjectKind::Directory),
             total_bytes: source_fingerprint.len,
             recursive_scope_known: true,
             conflicts: Vec::new(),
@@ -428,6 +503,7 @@ fn build_mkdir(
             strategy: PlannedStrategy::ExclusiveCreate,
             item_count: 1,
             file_count: 0,
+            directory_count: 1,
             total_bytes: 0,
             recursive_scope_known: true,
             conflicts: Vec::new(),
@@ -465,6 +541,8 @@ fn validate_source_set(mut sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, String
 
 #[allow(clippy::too_many_arguments)]
 fn collect_tree(
+    job: JobId,
+    kind: OperationKind,
     source: &Path,
     target: &Path,
     directories: &mut Vec<DirectoryTask>,
@@ -473,6 +551,7 @@ fn collect_tree(
     file_count: &mut u64,
     total_bytes: &mut u64,
     cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
 ) -> Result<(), String> {
     check_cancelled(cancelled)?;
     if directories.len() + files.len() >= MAX_PLAN_ITEMS {
@@ -518,6 +597,8 @@ fn collect_tree(
                     )
                 })?;
                 collect_tree(
+                    job,
+                    kind,
                     &child.path(),
                     &target.join(child.file_name()),
                     directories,
@@ -526,10 +607,20 @@ fn collect_tree(
                     file_count,
                     total_bytes,
                     cancelled,
+                    progress,
                 )?;
             }
         }
     }
+    progress(OperationPlanningProgress {
+        job,
+        kind,
+        discovered_items: *item_count,
+        discovered_files: *file_count,
+        discovered_directories: item_count.saturating_sub(*file_count),
+        discovered_bytes: *total_bytes,
+        current_path: Some(source.to_path_buf()),
+    });
     Ok(())
 }
 
@@ -566,6 +657,19 @@ pub(crate) fn revalidate(path: &Path, expected: &Fingerprint) -> Result<(), Stri
         || (expected.modified.is_some() && actual.modified != expected.modified)
     {
         return Err(format!("Source changed after review: {}", path.display()));
+    }
+    Ok(())
+}
+
+pub(crate) fn revalidate_directory_kind(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Cannot revalidate {}: {error}", path.display()))?;
+    reject_link_or_special(path, &metadata)?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Directory identity changed after review: {}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -795,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_plans_snapshot_only_selected_roots() {
+    fn permanent_delete_freezes_recursive_scope_while_recycle_stays_root_scoped() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("folder");
         fs::create_dir(&root).unwrap();
@@ -822,8 +926,11 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        assert_eq!(permanent.summary.item_count, 1);
-        assert!(!permanent.summary.recursive_scope_known);
+        assert_eq!(permanent.summary.item_count, 2);
+        assert_eq!(permanent.summary.file_count, 1);
+        assert_eq!(permanent.summary.directory_count, 1);
+        assert_eq!(permanent.summary.total_bytes, 8);
+        assert!(permanent.summary.recursive_scope_known);
         assert!(matches!(
             permanent.action,
             PlannedAction::PermanentDelete { .. }

@@ -1,6 +1,7 @@
 use crate::OperationEvent;
 use crate::planner::{
     FileTask, Fingerprint, OperationPlan, PlannedAction, TransferRoot, revalidate,
+    revalidate_directory_kind,
 };
 use crossbeam_channel::Sender;
 use fileadmin_domain::{
@@ -25,6 +26,8 @@ pub(crate) fn execute(
     let total_items = plan.summary.item_count;
     let completed_items = Arc::new(AtomicU64::new(0));
     let completed_bytes = Arc::new(AtomicU64::new(0));
+    let completed_files = Arc::new(AtomicU64::new(0));
+    let completed_directories = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(Mutex::new(Vec::new()));
     send_progress(events, &plan, JobPhase::Running, 0, 0, None);
 
@@ -60,12 +63,15 @@ pub(crate) fn execute(
             &completed_items,
             &failures,
         ),
-        PlannedAction::PermanentDelete { sources } => execute_permanent_delete(
+        PlannedAction::PermanentDelete { roots } => execute_permanent_delete(
             &plan,
-            sources,
+            roots,
             events,
             cancel_requested,
             &completed_items,
+            &completed_bytes,
+            &completed_files,
+            &completed_directories,
             &failures,
         ),
         PlannedAction::Rename {
@@ -117,6 +123,18 @@ pub(crate) fn execute(
 
     let completed_items = completed_items.load(Ordering::Acquire);
     let completed_bytes = completed_bytes.load(Ordering::Acquire);
+    let (completed_files, completed_directories) =
+        if plan.summary.kind == fileadmin_domain::OperationKind::PermanentDelete {
+            (
+                completed_files.load(Ordering::Acquire),
+                completed_directories.load(Ordering::Acquire),
+            )
+        } else {
+            (
+                completed_items.min(plan.summary.file_count),
+                completed_items.saturating_sub(plan.summary.file_count),
+            )
+        };
     let failures = Arc::try_unwrap(failures)
         .unwrap_or_else(|_| panic!("operation failure list still has owners"))
         .into_inner()
@@ -138,7 +156,12 @@ pub(crate) fn execute(
         outcome,
         completed_items,
         total_items,
+        completed_files,
+        total_files: plan.summary.file_count,
+        completed_directories,
+        total_directories: plan.summary.directory_count,
         completed_bytes,
+        total_bytes: plan.summary.total_bytes,
         failures,
         affected_directories: plan.affected_directories,
     }
@@ -495,51 +518,89 @@ fn execute_recycle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_permanent_delete(
     plan: &OperationPlan,
-    sources: &[(PathBuf, Fingerprint)],
+    roots: &[TransferRoot],
     events: &Sender<OperationEvent>,
     cancel_requested: &AtomicBool,
     completed_items: &AtomicU64,
+    completed_bytes: &AtomicU64,
+    completed_files: &AtomicU64,
+    completed_directories: &AtomicU64,
     failures: &Mutex<Vec<OperationFailure>>,
 ) {
-    for (source, fingerprint) in sources {
+    for root in roots {
         if cancel_requested.load(Ordering::Acquire) {
             return;
         }
-        if let Err(message) = revalidate(source, fingerprint) {
-            push_failure(failures, Some(source.clone()), message);
+        if let Err(message) = revalidate(&root.source, &root.source_fingerprint) {
+            push_failure(failures, Some(root.source.clone()), message);
             return;
         }
-        let result = match fingerprint.kind {
-            crate::planner::ObjectKind::File => fs::remove_file(source),
-            crate::planner::ObjectKind::Directory => fs::remove_dir_all(source),
-        };
-        match result {
-            Ok(()) => {
-                let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
-                send_progress(
-                    events,
-                    plan,
-                    JobPhase::Finalizing,
-                    items,
-                    0,
-                    Some(source.clone()),
-                );
+        for file in &root.files {
+            if cancel_requested.load(Ordering::Acquire) {
+                return;
             }
-            Err(error) => {
-                let context = if fingerprint.kind == crate::planner::ObjectKind::Directory {
-                    "Permanent directory deletion failed and may have removed some descendants"
-                } else {
-                    "Permanent file deletion failed"
-                };
+            if let Err(message) = revalidate(&file.source, &file.fingerprint) {
+                push_failure(failures, Some(file.source.clone()), message);
+                return;
+            }
+            if let Err(error) = fs::remove_file(&file.source) {
                 push_failure(
                     failures,
-                    Some(source.clone()),
-                    format!("{context}: {error}"),
+                    Some(file.source.clone()),
+                    format!("Permanent file deletion failed: {error}"),
                 );
                 return;
             }
+            let bytes = completed_bytes.fetch_add(file.fingerprint.len, Ordering::AcqRel)
+                + file.fingerprint.len;
+            let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
+            let files = completed_files.fetch_add(1, Ordering::AcqRel) + 1;
+            send_delete_progress(
+                events,
+                plan,
+                JobPhase::Running,
+                items,
+                files,
+                completed_directories.load(Ordering::Acquire),
+                bytes,
+                Some(file.source.clone()),
+            );
+        }
+
+        let mut directories: Vec<_> = root.directories.iter().collect();
+        directories
+            .sort_by_key(|directory| std::cmp::Reverse(directory.source.components().count()));
+        for directory in directories {
+            if cancel_requested.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(message) = revalidate_directory_kind(&directory.source) {
+                push_failure(failures, Some(directory.source.clone()), message);
+                return;
+            }
+            if let Err(error) = fs::remove_dir(&directory.source) {
+                push_failure(
+                    failures,
+                    Some(directory.source.clone()),
+                    format!("Permanent directory deletion failed: {error}"),
+                );
+                return;
+            }
+            let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
+            let directories = completed_directories.fetch_add(1, Ordering::AcqRel) + 1;
+            send_delete_progress(
+                events,
+                plan,
+                JobPhase::Finalizing,
+                items,
+                completed_files.load(Ordering::Acquire),
+                directories,
+                completed_bytes.load(Ordering::Acquire),
+                Some(directory.source.clone()),
+            );
         }
     }
 }
@@ -628,6 +689,37 @@ fn send_progress(
         phase,
         completed_items,
         total_items: plan.summary.item_count,
+        completed_files: completed_items.min(plan.summary.file_count),
+        total_files: plan.summary.file_count,
+        completed_directories: completed_items.saturating_sub(plan.summary.file_count),
+        total_directories: plan.summary.directory_count,
+        completed_bytes,
+        total_bytes: plan.summary.total_bytes,
+        current_path,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_delete_progress(
+    events: &Sender<OperationEvent>,
+    plan: &OperationPlan,
+    phase: JobPhase,
+    completed_items: u64,
+    completed_files: u64,
+    completed_directories: u64,
+    completed_bytes: u64,
+    current_path: Option<PathBuf>,
+) {
+    let _ = events.try_send(OperationEvent::Progress(OperationProgress {
+        job: plan.summary.job,
+        kind: plan.summary.kind,
+        phase,
+        completed_items,
+        total_items: plan.summary.item_count,
+        completed_files,
+        total_files: plan.summary.file_count,
+        completed_directories,
+        total_directories: plan.summary.directory_count,
         completed_bytes,
         total_bytes: plan.summary.total_bytes,
         current_path,

@@ -7,7 +7,10 @@ mod executor;
 mod planner;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
-use fileadmin_domain::{JobId, OperationIntent, OperationProgress, OperationReport, PlanSummary};
+use fileadmin_domain::{
+    JobId, OperationIntent, OperationPlanningProgress, OperationProgress, OperationReport,
+    PlanSummary,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -17,10 +20,7 @@ const EVENT_CAPACITY: usize = 32;
 
 #[derive(Clone, Debug)]
 pub enum OperationEvent {
-    Planning {
-        job: JobId,
-        kind: fileadmin_domain::OperationKind,
-    },
+    Planning(OperationPlanningProgress),
     PlanReady(PlanSummary),
     Progress(OperationProgress),
     Finished(OperationReport),
@@ -140,8 +140,31 @@ fn coordinator(
         match command {
             Command::Plan { job, intent } => {
                 let kind = intent.kind();
-                let _ = events.send(OperationEvent::Planning { job, kind });
-                match planner::build_plan(job, intent, &cancel_requested) {
+                let initial = OperationPlanningProgress {
+                    job,
+                    kind,
+                    discovered_items: 0,
+                    discovered_files: 0,
+                    discovered_directories: 0,
+                    discovered_bytes: 0,
+                    current_path: None,
+                };
+                let _ = events.send(OperationEvent::Planning(initial));
+                let mut last_update = std::time::Instant::now();
+                let mut publish_progress = |progress: OperationPlanningProgress| {
+                    if progress.discovered_items == 1
+                        || last_update.elapsed() >= std::time::Duration::from_millis(75)
+                    {
+                        let _ = events.try_send(OperationEvent::Planning(progress));
+                        last_update = std::time::Instant::now();
+                    }
+                };
+                match planner::build_plan_with_progress(
+                    job,
+                    intent,
+                    &cancel_requested,
+                    &mut publish_progress,
+                ) {
                     Ok(_) if cancel_requested.load(Ordering::Acquire) => {
                         let _ = events.send(OperationEvent::Failed {
                             job: Some(job),

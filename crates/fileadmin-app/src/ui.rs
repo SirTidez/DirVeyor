@@ -490,7 +490,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
     let selection = app.selected_count();
     let operation_status = match &app.operation {
         OperationView::Idle => None,
-        OperationView::Planning { kind, .. } => Some(format!("Planning {}…", kind.label())),
+        OperationView::Planning(progress) => Some(format!("Planning {}…", progress.kind.label())),
         OperationView::Review(summary) => {
             Some(format!("Review {} before execution", summary.kind.label()))
         }
@@ -1187,7 +1187,7 @@ fn render_text_prompt(frame: &mut Frame, area: Rect, prompt: &TextPrompt) {
 fn render_operation(frame: &mut Frame, area: Rect, app: &AppState) {
     match &app.operation {
         OperationView::Idle => {}
-        OperationView::Planning { kind, .. } => render_planning(frame, area, *kind),
+        OperationView::Planning(progress) => render_planning(frame, area, progress),
         OperationView::Review(summary) => {
             render_review(frame, area, summary, &app.delete_confirmation)
         }
@@ -1199,28 +1199,44 @@ fn render_operation(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 }
 
-fn render_planning(frame: &mut Frame, area: Rect, kind: OperationKind) {
+fn render_planning(
+    frame: &mut Frame,
+    area: Rect,
+    progress: &fileadmin_domain::OperationPlanningProgress,
+) {
     let popup = centered_rect(74, 28, area);
-    let lines = vec![
+    let mut lines = vec![
         Line::styled(
-            format!("Discovering exact scope for {}…", kind.label()),
+            format!("Discovering exact scope for {}…", progress.kind.label()),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::raw("Checking paths, conflicts, links, capacity strategy, and item totals."),
+        Line::raw(format!(
+            "Found: {} files · {} folders · {}",
+            progress.discovered_files,
+            progress.discovered_directories,
+            human_size(progress.discovered_bytes)
+        )),
+        Line::raw(format!("Entries inspected: {}", progress.discovered_items)),
         Line::raw("No files have changed."),
-        Line::raw(""),
-        Line::styled(
-            "Esc Request cancellation",
-            Style::default().fg(Color::DarkGray),
-        ),
     ];
+    if let Some(path) = &progress.current_path {
+        lines.push(Line::raw(format!(
+            "Scanning: {}",
+            safe_text(&path.to_string_lossy())
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Esc Request cancellation",
+        Style::default().fg(Color::DarkGray),
+    ));
     render_modal(
         frame,
         popup,
-        &format!(" Plan {} ", kind.label()),
+        &format!(" Plan {} ", progress.kind.label()),
         lines,
         Color::Cyan,
     );
@@ -1232,9 +1248,10 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_co
         Line::styled(
             if summary.recursive_scope_known {
                 format!(
-                    "{} items · {} files · {}",
-                    summary.item_count,
+                    "{} selected · {} files · {} folders · {} total",
+                    summary.sources.len(),
                     summary.file_count,
+                    summary.directory_count,
                     human_size(summary.total_bytes)
                 )
             } else {
@@ -1306,7 +1323,11 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_co
         ));
     }
     lines.push(Line::styled(
-        review_confirmation(summary.kind),
+        if summary.kind == OperationKind::PermanentDelete && delete_confirmation != "DELETE" {
+            "Enter locked until DELETE is typed"
+        } else {
+            review_confirmation(summary.kind)
+        },
         Style::default()
             .fg(if summary.kind == OperationKind::PermanentDelete {
                 Color::Red
@@ -1353,12 +1374,36 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
         ),
         Line::raw(""),
         Line::raw(progress_bar(percent.unwrap_or(0), 36)),
-        Line::raw(format!(
+    ];
+    if progress.kind.is_delete() {
+        lines.push(Line::raw(format!(
+            "Removed: {} / {}",
+            human_size(progress.completed_bytes),
+            human_size(progress.total_bytes)
+        )));
+        lines.push(Line::raw(format!(
+            "Files: {} / {}",
+            progress.completed_files, progress.total_files
+        )));
+        lines.push(Line::raw(format!(
+            "Folders: {} / {}",
+            progress.completed_directories, progress.total_directories
+        )));
+        lines.push(Line::raw(format!(
+            "All entries: {} / {}",
+            progress.completed_items, progress.total_items
+        )));
+        if progress.kind == OperationKind::Recycle && progress.total_directories > 0 {
+            lines.push(Line::styled(
+                "Windows reports each selected tree only after its Recycle Bin handoff completes",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else {
+        lines.push(Line::raw(format!(
             "Items: {} / {}",
             progress.completed_items, progress.total_items
-        )),
-    ];
-    if !progress.kind.is_delete() {
+        )));
         lines.push(Line::raw(format!(
             "Transferred: {} / {}",
             human_size(progress.completed_bytes),
@@ -1398,8 +1443,13 @@ fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::Ope
         ),
         Line::raw(if report.kind.is_delete() {
             format!(
-                "{} of {} selected items completed",
-                report.completed_items, report.total_items
+                "{} / {} files · {} / {} folders · {} / {} removed",
+                report.completed_files,
+                report.total_files,
+                report.completed_directories,
+                report.total_directories,
+                human_size(report.completed_bytes),
+                human_size(report.total_bytes)
             )
         } else {
             format!(
@@ -1547,8 +1597,12 @@ fn outcome_label(outcome: JobOutcome) -> &'static str {
 }
 
 fn progress_status(progress: &fileadmin_domain::OperationProgress) -> String {
-    let percent = progress_percent(progress.completed_bytes, progress.total_bytes)
-        .or_else(|| progress_percent(progress.completed_items, progress.total_items));
+    let percent = if progress.kind.is_delete() {
+        progress_percent(progress.completed_items, progress.total_items)
+    } else {
+        progress_percent(progress.completed_bytes, progress.total_bytes)
+            .or_else(|| progress_percent(progress.completed_items, progress.total_items))
+    };
     match percent {
         Some(percent) => format!(
             "{} {}% · {}",
@@ -1744,7 +1798,9 @@ fn month_label(month: time::Month) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fileadmin_domain::{FileEntry, JobId, LoadState, OperationProgress, PlannedStrategy};
+    use fileadmin_domain::{
+        FileEntry, JobId, LoadState, OperationPlanningProgress, OperationProgress, PlannedStrategy,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -1891,6 +1947,7 @@ mod tests {
             strategy: PlannedStrategy::CopyVerifyRemove,
             item_count: 1,
             file_count: 1,
+            directory_count: 0,
             total_bytes: 1_024,
             recursive_scope_known: true,
             conflicts: Vec::new(),
@@ -1921,6 +1978,7 @@ mod tests {
             strategy: PlannedStrategy::PermanentDelete,
             item_count: 1,
             file_count: 1,
+            directory_count: 0,
             total_bytes: 1_024,
             recursive_scope_known: true,
             conflicts: Vec::new(),
@@ -1931,7 +1989,7 @@ mod tests {
         assert!(review.contains("Review permanent delete"));
         assert!(review.contains("Type DELETE to confirm irreversible removal"));
         assert!(review.contains("Confirmation: DEL_"));
-        assert!(review.contains("Enter Permanently delete"));
+        assert!(review.contains("Enter locked until DELETE is typed"));
     }
 
     #[test]
@@ -1943,6 +2001,10 @@ mod tests {
             phase: JobPhase::Running,
             completed_items: 2,
             total_items: 4,
+            completed_files: 2,
+            total_files: 4,
+            completed_directories: 0,
+            total_directories: 0,
             completed_bytes: 512,
             total_bytes: 1_024,
             current_path: Some(PathBuf::from("right").join("example.txt")),
@@ -1953,6 +2015,45 @@ mod tests {
         assert!(screen.contains("Items: 2 / 4"));
         assert!(screen.contains("50%"));
         assert!(screen.contains("Cancel safely"));
+    }
+
+    #[test]
+    fn permanent_delete_scan_and_progress_show_recursive_scope() {
+        let mut app = populated_app();
+        app.operation = OperationView::Planning(OperationPlanningProgress {
+            job: JobId(18),
+            kind: OperationKind::PermanentDelete,
+            discovered_items: 1_212,
+            discovered_files: 1_000,
+            discovered_directories: 212,
+            discovered_bytes: 8 * 1024 * 1024,
+            current_path: Some(PathBuf::from("large-tree").join("content")),
+        });
+        let scan = rendered_screen(&app, 140, 35);
+        assert!(scan.contains("Found: 1000 files · 212 folders · 8.0 MB"));
+        assert!(scan.contains("Entries inspected: 1212"));
+        assert!(scan.contains("No files have changed"));
+
+        app.operation = OperationView::Running(OperationProgress {
+            job: JobId(18),
+            kind: OperationKind::PermanentDelete,
+            phase: JobPhase::Running,
+            completed_items: 500,
+            total_items: 1_212,
+            completed_files: 500,
+            total_files: 1_000,
+            completed_directories: 0,
+            total_directories: 212,
+            completed_bytes: 4 * 1024 * 1024,
+            total_bytes: 8 * 1024 * 1024,
+            current_path: Some(PathBuf::from("large-tree").join("content.bin")),
+        });
+        let running = rendered_screen(&app, 140, 35);
+        assert!(running.contains("Removed: 4.0 MB / 8.0 MB"));
+        assert!(running.contains("Files: 500 / 1000"));
+        assert!(running.contains("Folders: 0 / 212"));
+        assert!(running.contains("All entries: 500 / 1212"));
+        assert!(running.contains("41%"));
     }
 
     #[test]

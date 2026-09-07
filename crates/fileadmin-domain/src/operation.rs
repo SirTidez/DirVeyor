@@ -109,6 +109,7 @@ pub struct PlanSummary {
     pub strategy: PlannedStrategy,
     pub item_count: u64,
     pub file_count: u64,
+    pub directory_count: u64,
     pub total_bytes: u64,
     pub recursive_scope_known: bool,
     pub conflicts: Vec<ConflictSummary>,
@@ -132,8 +133,23 @@ pub struct OperationProgress {
     pub phase: JobPhase,
     pub completed_items: u64,
     pub total_items: u64,
+    pub completed_files: u64,
+    pub total_files: u64,
+    pub completed_directories: u64,
+    pub total_directories: u64,
     pub completed_bytes: u64,
     pub total_bytes: u64,
+    pub current_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationPlanningProgress {
+    pub job: JobId,
+    pub kind: OperationKind,
+    pub discovered_items: u64,
+    pub discovered_files: u64,
+    pub discovered_directories: u64,
+    pub discovered_bytes: u64,
     pub current_path: Option<PathBuf>,
 }
 
@@ -158,7 +174,12 @@ pub struct OperationReport {
     pub outcome: JobOutcome,
     pub completed_items: u64,
     pub total_items: u64,
+    pub completed_files: u64,
+    pub total_files: u64,
+    pub completed_directories: u64,
+    pub total_directories: u64,
     pub completed_bytes: u64,
+    pub total_bytes: u64,
     pub failures: Vec<OperationFailure>,
     pub affected_directories: Vec<PathBuf>,
 }
@@ -166,10 +187,7 @@ pub struct OperationReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationView {
     Idle,
-    Planning {
-        job: JobId,
-        kind: OperationKind,
-    },
+    Planning(OperationPlanningProgress),
     Review(PlanSummary),
     Running(OperationProgress),
     Finished(OperationReport),
@@ -182,10 +200,7 @@ pub enum OperationView {
 
 impl OperationView {
     pub const fn is_busy(&self) -> bool {
-        matches!(
-            self,
-            Self::Planning { .. } | Self::Review(_) | Self::Running(_)
-        )
+        matches!(self, Self::Planning(_) | Self::Review(_) | Self::Running(_))
     }
 }
 
@@ -224,10 +239,15 @@ mod tests {
     #[test]
     fn operation_busy_state_requires_an_unfinished_job() {
         assert!(
-            OperationView::Planning {
+            OperationView::Planning(OperationPlanningProgress {
                 job: JobId(1),
                 kind: OperationKind::Copy,
-            }
+                discovered_items: 0,
+                discovered_files: 0,
+                discovered_directories: 0,
+                discovered_bytes: 0,
+                current_path: None,
+            })
             .is_busy()
         );
         assert!(!OperationView::Idle.is_busy());

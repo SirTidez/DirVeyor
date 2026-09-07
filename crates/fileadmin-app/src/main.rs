@@ -12,7 +12,8 @@ use fileadmin_domain::{
     paths_match,
 };
 use fileadmin_domain::{
-    JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
+    JobId, JobOutcome, OperationIntent, OperationKind, OperationPlanningProgress, OperationView,
+    TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
 use fileadmin_fs::{
@@ -556,8 +557,8 @@ fn drain_operation_events(
 ) {
     while let Ok(event) = operations.try_recv() {
         match event {
-            OperationEvent::Planning { job, kind } => {
-                app.operation = OperationView::Planning { job, kind };
+            OperationEvent::Planning(progress) => {
+                app.operation = OperationView::Planning(progress);
             }
             OperationEvent::PlanReady(summary) => {
                 app.delete_confirmation.clear();
@@ -590,7 +591,7 @@ fn drain_operation_events(
 
 fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: KeyEvent) {
     match app.operation.clone() {
-        OperationView::Planning { .. } => {
+        OperationView::Planning(_) => {
             if key.code == KeyCode::Esc {
                 operations.cancel();
                 app.notice = Some("Cancellation requested while planning".into());
@@ -730,7 +731,7 @@ fn handle_text_prompt(app: &mut AppState, operations: &OperationEngine, key: Key
             };
             match operations.submit(intent) {
                 Ok(job) => {
-                    app.operation = OperationView::Planning { job, kind };
+                    app.operation = planning_view(job, kind);
                     app.text_prompt = None;
                 }
                 Err(error) => {
@@ -787,9 +788,21 @@ fn submit_delete(app: &mut AppState, operations: &OperationEngine) {
 fn submit_intent(app: &mut AppState, operations: &OperationEngine, intent: OperationIntent) {
     let kind = intent.kind();
     match operations.submit(intent) {
-        Ok(job) => app.operation = OperationView::Planning { job, kind },
+        Ok(job) => app.operation = planning_view(job, kind),
         Err(error) => app.notice = Some(submit_error_message(error)),
     }
+}
+
+fn planning_view(job: JobId, kind: OperationKind) -> OperationView {
+    OperationView::Planning(OperationPlanningProgress {
+        job,
+        kind,
+        discovered_items: 0,
+        discovered_files: 0,
+        discovered_directories: 0,
+        discovered_bytes: 0,
+        current_path: None,
+    })
 }
 
 fn begin_rename(app: &mut AppState) {
@@ -1736,6 +1749,7 @@ mod preview_tests {
             strategy: PlannedStrategy::PermanentDelete,
             item_count: 1,
             file_count: 1,
+            directory_count: 0,
             total_bytes: 10,
             recursive_scope_known: true,
             conflicts: Vec::new(),
