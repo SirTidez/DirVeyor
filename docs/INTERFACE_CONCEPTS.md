@@ -27,7 +27,7 @@ actions legible at a glance.
 │                                  │ 2 items · 1.9 GB            │
 │                                  │ Space available 238 GB      │
 ├──────────────────────────────────┴─────────────────────────────┤
-│ ↑↓ Move  ← Back  → Open/select  Enter Open  c Copy  m Move     │
+│ ↑↓ Move  ← Back  → Open/select  Enter Open  C Copy  M Move     │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +55,7 @@ same way.
 │ ▁▂▄▆▇▇▆▅▆▇  read / write   │ 14:32 Copy worker reduced to 2    │
 │ Source busy; backpressure  │ 14:32 Destination latency stable  │
 ├────────────────────────────┴────────────────────────────────────┤
-│ Enter Details  p Pause/Resume  r Retry  c Cancel                │
+│ Enter Details  P Pause/Resume  R Retry  C Cancel                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

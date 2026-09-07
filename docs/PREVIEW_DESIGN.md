@@ -30,16 +30,17 @@ browser panes exactly as they were.
 
 | Key | Preview action |
 | --- | --- |
-| `Esc` or `q` | Return to Browse |
-| Arrows or `j`/`k` | Scroll vertically |
+| `Esc` or `Q` | Return to Browse |
+| Arrows or `J`/`K` | Scroll vertically |
 | `PageUp` / `PageDown` | Scroll by viewport |
-| `Home` / `End` or `g` / `G` | Start/end of loaded document |
+| `Home` / `End` | Start/end of loaded window |
+| `G` / `Shift+G` | First/last file window |
 | Left/right arrows | Horizontal scroll when wrapping is off |
-| `w` | Toggle soft wrapping |
-| `/` or `Ctrl+f` | Open Find for the active representation |
-| `n` / `N` or `F3` / `Shift+F3` | Next/previous search result |
-| `r` | Reload the file after it changes |
-| `v` | Cycle the formats available for this file type |
+| `W` | Toggle soft wrapping |
+| `/` or `Ctrl+F` | Open Find for the active representation |
+| `N` / `Shift+N` or `F3` / `Shift+F3` | Next/previous search result |
+| `R` | Reload the file after it changes |
+| `V` | Cycle the formats available for this file type |
 | `?` or `F1` | Preview-specific help |
 
 Search and scrolling operate on the active representation. Search never reads
@@ -49,17 +50,17 @@ past the bounded file window silently; the UI labels a partial search.
 
 Find opens a one-line prompt without obscuring the current match. Literal search
 is the default and matching is initially case-insensitive. While the prompt is
-open, `Ctrl+r` toggles Literal/Regex and
-`Alt+c` toggles case-sensitive/case-insensitive matching. The prompt labels the
+open, `Ctrl+R` toggles Literal/Regex and
+`Alt+C` toggles case-sensitive/case-insensitive matching. The prompt labels the
 current mode, reports invalid expressions inline, and leaves the last valid
 results highlighted while an invalid pattern is being edited.
 
-While Find owns keyboard input, printable keys—including `q`—edit the query.
+While Find owns keyboard input, printable keys—including `Q`—edit the query.
 `Esc` closes Find but remains in Preview; a subsequent `Esc` exits Preview. This
 prevents an ordinary search term from unexpectedly closing the document.
 
 Matches use a visible highlight plus a `current / known total` status. Enter
-accepts the query and moves to the next match; `n`, `N`, and the F3 bindings
+accepts the query and moves to the next match; `N`, `Shift+N`, and the F3 bindings
 navigate afterward. Search wraps only after showing a short `Wrapped to start`
 or `Wrapped to end` notice. An empty query clears highlights.
 
@@ -216,7 +217,7 @@ caps both pattern and result sizes. Moving search compilation and matching to a
 replaceable worker remains follow-up work before increasing snapshot limits.
 
 If the source length or modified time changes after loading, Preview shows
-`File changed on disk · r Reload`; it does not silently replace the content and
+`File changed on disk · R Reload`; it does not silently replace the content and
 move the user's scroll position.
 
 ## 6. Safety boundaries

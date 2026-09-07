@@ -48,36 +48,45 @@ cargo run
 
 Common controls:
 
+Letter shortcuts are displayed as capital letters for readability; pressing
+Shift is not required unless a binding explicitly says `Shift`.
+
 | Key | Action |
 | --- | --- |
 | `Tab` | Switch pane |
-| Arrow keys or `j`/`k` | Move focus |
+| Arrow keys or `J`/`K` | Move focus |
 | `Right Arrow` | Open the focused directory, or toggle selection for a focused file |
 | `Left Arrow` or `Backspace` | Go to the parent and restore focus to the directory just exited |
 | `Space` | Toggle selection |
 | `Enter` | Open a directory, preview a focused file, or retry a failed scan |
 | `Enter` on `..` | Go to the parent and restore focus; from a Windows drive root, show all drives |
 | `/` | Filter the active pane |
-| `h` | Toggle dotfiles |
-| `s` | Cycle sort field |
-| `p` | Preview the focused human-readable file |
-| `c` | Review a copy from the active pane to the other pane |
-| `m` | Review a move from the active pane to the other pane |
-| `d` or `Delete` | Review moving the focused/selected items to Recycle Bin / Trash |
-| `r` or `F2` | Enter a new name, then review the rename |
-| `n` | Enter a name, then review creating a folder in the active pane |
+| `H` | Toggle dotfiles |
+| `S` | Cycle sort field |
+| `P` | Preview the focused human-readable file |
+| `F` | Add or remove the focused folder from Favorites |
+| `Ctrl+F` | Open the dedicated Favorites panel |
+| `C` | Review a copy from the active pane to the other pane |
+| `M` | Review a move from the active pane to the other pane |
+| `D` or `Delete` | Review moving the focused/selected items to Recycle Bin / Trash |
+| `R` or `F2` | Enter a new name, then review the rename |
+| `N` | Enter a name, then review creating a folder in the active pane |
 | `Enter` in review | Approve and execute the exact displayed plan |
 | `Esc` in review | Cancel without changing files |
-| `x`, `c`, or `Esc` while running | Request cancellation at the next safe point |
+| `X`, `C`, or `Esc` while running | Request cancellation at the next safe point |
 | `F1` or `?` | Show help |
-| `q` or `Ctrl+C` | Quit, or request cancellation when a job is active |
+| `Q` or `Ctrl+C` | Quit, or request cancellation when a job is active |
 
-Inside Preview, use arrows or `j`/`k` to scroll, `/` or `Ctrl+f` to find,
-`Ctrl+r` in Find to toggle literal/regex matching, `n`/`N` for the next/previous
-match, and `Esc` or `q` to return to Browse. Markdown uses `1` Raw, `2` Split,
+Inside Preview, use arrows or `J`/`K` to scroll, `/` or `Ctrl+F` to find,
+`Ctrl+R` in Find to toggle literal/regex matching, `N`/`Shift+N` for the
+next/previous match, and `Esc` or `Q` to return to Browse. Markdown uses `1` Raw, `2` Split,
 and `3` rendered; JSON uses `1` Raw and `3` Pretty. `F1` shows the complete
 preview-specific key guide. For large files, `[` and `]` load the previous or
-next byte window, while `g` and `G` load the first or last window.
+next byte window, while `G` and `Shift+G` load the first or last window.
+
+The all-drives view groups the detected user folder, saved Favorites, and
+available drives into separate sections. Favorites persist in FileAdmin's user
+configuration directory and can be opened or removed from the `Ctrl+F` panel.
 
 ## Validate
 

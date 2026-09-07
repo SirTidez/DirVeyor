@@ -69,6 +69,8 @@ Read-only filesystem adapter:
   free/total capacity metrics.
 - cancellable recursive folder-size analysis that does not follow links,
   junctions, or reparse points.
+- a bounded JSON Favorites store published through a temporary file, plus
+  platform-specific user-home discovery for the all-drives quick-access area.
 
 The entry cap is a prototype safety bound, not the final large-directory
 strategy. Paging or a disk-backed index must replace it before million-entry
@@ -155,6 +157,23 @@ Windows hidden attributes are not yet considered.
 - Filenames and paths cannot inject terminal control or bidirectional controls.
 - Terminal state is restored after normal exit and unwinding panics.
 - Focus and selection have independent visual and state representations.
+- User-folder and Favorite rows are non-selectable virtual locations, so they
+  can navigate a pane but can never become filesystem-operation sources.
+
+## Quick access and Favorites
+
+The all-drives listing is decorated in the foreground after native drive
+discovery. It presents separate User folder, Favorites, and Drives groups while
+preserving the drive metadata returned by the scanner. The dedicated Favorites
+panel reads the same ordered list and opens its chosen folder in the active
+browser pane.
+
+Favorites persist as a bounded list of paths in FileAdmin's per-user
+configuration directory. Saving creates the parent directory when needed and
+publishes a complete replacement file, preventing a partially written JSON
+document from becoming the next startup state. Duplicate paths are removed
+using platform-appropriate path comparison, and the user's home directory is
+not repeated in the Favorites subsection of the all-drives view.
 
 ## Known limitations
 
@@ -165,8 +184,8 @@ Windows hidden attributes are not yet considered.
 - Symlinks are identified but cannot be followed from the UI.
 - Only dot-prefixed hidden files are recognized.
 - Inspector layout is hidden below 110 columns; a compact overlay is planned.
-- There is no persistent configuration, bookmarks, history, logging, durable
-  queue, pause/resume, undo, or recovery journal.
+- Beyond Favorites, there is no persistent configuration, browsing history,
+  logging, durable queue, pause/resume, undo, or recovery journal.
 - Capacity preflight is not yet connected to operation plans.
 - Links, junctions, reparse points, and special files are intentionally blocked.
 - Folder totals use logical file lengths rather than allocated clusters, so

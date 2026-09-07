@@ -143,18 +143,19 @@ notification that never hides errors.
 | Key | Browse meaning | Queue meaning |
 | --- | --- | --- |
 | `Tab` / `Shift+Tab` | Change pane or region | Change region |
-| Up/down or `j`/`k` | Move focus | Move focus |
+| Up/down or `J`/`K` | Move focus | Move focus |
 | `Right Arrow` | Open directory or toggle file selection | Expand details |
 | `Left Arrow` | Parent directory and restore prior focus | Collapse details |
 | `Enter` | Open directory or preview supported file | Expand job |
 | `Space` | Toggle selection | Select job |
 | `Backspace` | Parent directory and restore prior focus | Collapse details |
 | `/` | Filter current pane | Filter jobs |
-| `c` | Review copy | Cancel filter / contextual action |
-| `m` | Review move | Move/reprioritize job |
-| `d` | Review delete | Remove completed entry |
-| `r` | Rename | Retry failed subset |
-| `p` | Preview focused text file | Pause or resume |
+| `C` | Review copy | Cancel filter / contextual action |
+| `M` | Review move | Move/reprioritize job |
+| `D` | Review delete | Remove completed entry |
+| `R` | Rename | Retry failed subset |
+| `P` | Preview focused text file | Pause or resume |
+| `F` / `Ctrl+F` | Toggle favorite / open Favorites | — |
 | `Esc` | Back/cancel overlay | Back/cancel overlay |
 | `?` or `F1` | Context help | Context help |
 
