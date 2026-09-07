@@ -1,6 +1,7 @@
 use fileadmin_domain::{
     JobId, OperationIntent, OperationKind, OperationPlanningProgress, PlanSummary, PlannedStrategy,
 };
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::path::{Component, Path, PathBuf};
@@ -172,6 +173,7 @@ fn build_transfer(
     let mut all_same_volume = true;
     let mut every_target_clear = true;
     let mut affected = vec![destination.clone()];
+    let mut target_keys = HashSet::with_capacity(sources.len());
 
     for source in &sources {
         check_cancelled(cancelled)?;
@@ -194,6 +196,12 @@ fn build_transfer(
             .file_name()
             .ok_or_else(|| "A selected source has no file name".to_string())?;
         let requested_target = destination.join(leaf);
+        if !target_keys.insert(target_identity_key(&requested_target)) {
+            return Err(format!(
+                "Multiple selected sources would use the same destination name: {}",
+                requested_target.display()
+            ));
+        }
         let target_exists = requested_target
             .try_exists()
             .map_err(|error| format!("Cannot inspect destination: {error}"))?;
@@ -254,13 +262,17 @@ fn build_transfer(
             .clamp(1, 2)
     };
     let warnings = match strategy {
-        PlannedStrategy::CopyVerifyRemove => vec![format!(
-            "Sources remain until the streamed copy completes using {} verification",
-            verification.label()
-        )],
+        PlannedStrategy::CopyVerifyRemove => vec![
+            format!(
+                "Sources remain until the streamed copy completes using {} verification",
+                verification.label()
+            ),
+            format!("A bounded queue feeds {worker_count} concurrent file worker(s)"),
+        ],
         PlannedStrategy::ParallelCopy => vec![
             "Directories stream without a fixed item limit; colliding files pause for a choice"
                 .into(),
+            format!("A bounded queue feeds {worker_count} concurrent file worker(s)"),
         ],
         PlannedStrategy::AtomicRename => {
             vec!["The same-volume rename is a non-interruptible finalization step".into()]
@@ -299,6 +311,16 @@ fn build_transfer(
         action,
         affected_directories: affected,
     })
+}
+
+#[cfg(windows)]
+fn target_identity_key(path: &Path) -> OsString {
+    path.to_string_lossy().to_lowercase().into()
+}
+
+#[cfg(not(windows))]
+fn target_identity_key(path: &Path) -> OsString {
+    path.as_os_str().to_os_string()
 }
 
 fn build_delete(
@@ -722,10 +744,15 @@ fn is_windows_reparse_point(_metadata: &Metadata) -> bool {
     false
 }
 
-pub(crate) fn keep_both_target(requested: &Path, kind: ObjectKind) -> Result<PathBuf, String> {
+pub(crate) fn keep_both_target(
+    requested: &Path,
+    kind: ObjectKind,
+    reserved: &std::collections::HashSet<PathBuf>,
+) -> Result<PathBuf, String> {
     if !requested
         .try_exists()
         .map_err(|error| format!("Cannot inspect destination: {error}"))?
+        && !reserved.contains(requested)
     {
         return Ok(requested.to_path_buf());
     }
@@ -741,6 +768,7 @@ pub(crate) fn keep_both_target(requested: &Path, kind: ObjectKind) -> Result<Pat
         if !candidate
             .try_exists()
             .map_err(|error| format!("Cannot inspect destination: {error}"))?
+            && !reserved.contains(&candidate)
         {
             return Ok(candidate);
         }
@@ -1002,6 +1030,31 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "Source and destination resolve to the same item");
+    }
+
+    #[test]
+    fn transfer_rejects_sources_with_the_same_destination_name() {
+        let first_parent = tempfile::tempdir().unwrap();
+        let second_parent = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let first = first_parent.path().join("shared.txt");
+        let second = second_parent.path().join("shared.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let error = build_plan(
+            JobId(6),
+            OperationIntent::Copy {
+                sources: vec![first, second],
+                destination: destination.path().to_path_buf(),
+                verification: fileadmin_domain::VerificationMode::Full,
+            },
+            &cancelled,
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("Multiple selected sources would use the same destination name"));
     }
 
     #[cfg(windows)]

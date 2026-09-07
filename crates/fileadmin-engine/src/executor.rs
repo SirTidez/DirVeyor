@@ -3,12 +3,13 @@ use crate::planner::{
     keep_both_target, revalidate, revalidate_directory_kind,
 };
 use crate::{ConflictResolution, OperationEvent};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender};
 use fileadmin_domain::{
     ConflictAction, ConflictKind, JobOutcome, JobPhase, OperationFailure, OperationProgress,
     OperationReport, TransferConflict, VerificationMode, VersionRelation,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -198,7 +199,7 @@ fn execute_transfer(
     plan: &OperationPlan,
     roots: &[TransferRoot],
     remove_sources: bool,
-    _worker_count: usize,
+    worker_count: usize,
     verification: fileadmin_domain::VerificationMode,
     events: &Sender<OperationEvent>,
     conflict_resolutions: &Receiver<ConflictResolution>,
@@ -209,46 +210,115 @@ fn execute_transfer(
     completed_directories: &Arc<AtomicU64>,
     failures: &Arc<Mutex<Vec<OperationFailure>>>,
 ) {
-    let mut state = match StreamingTransfer::new(
-        plan,
-        verification,
-        remove_sources,
-        events,
-        conflict_resolutions,
-        cancel_requested,
-        completed_items,
-        completed_bytes,
-        completed_files,
-        completed_directories,
-    ) {
-        Ok(state) => state,
-        Err(message) => {
-            push_failure(failures, None, message);
-            return;
+    let worker_count = worker_count.max(1);
+    let queue_capacity = worker_count.saturating_mul(8).max(8);
+    let (work_sender, work_receiver) = crossbeam_channel::bounded(queue_capacity);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(StreamingProgress::default());
+    let journal = if remove_sources {
+        match tempfile::tempfile() {
+            Ok(file) => Some(Arc::new(Mutex::new(file))),
+            Err(error) => {
+                push_failure(
+                    failures,
+                    None,
+                    format!("Cannot create the temporary move journal: {error}"),
+                );
+                return;
+            }
         }
+    } else {
+        None
     };
-    for root in roots {
-        if let Err((path, message)) = state.visit(&root.source, &root.target) {
-            push_failure(failures, Some(path), message);
-            return;
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let receiver = work_receiver.clone();
+            let stopped = Arc::clone(&stopped);
+            let progress = Arc::clone(&progress);
+            let journal = journal.clone();
+            workers.push(scope.spawn(move || {
+                transfer_worker(
+                    receiver,
+                    verification,
+                    events,
+                    plan,
+                    cancel_requested,
+                    completed_items,
+                    completed_bytes,
+                    completed_files,
+                    completed_directories,
+                    failures,
+                    &stopped,
+                    &progress,
+                    journal.as_deref(),
+                );
+            }));
         }
-    }
-    state.scope_complete = true;
-    state.publish(None);
-    if remove_sources && !cancel_requested.load(Ordering::Acquire) {
-        if let Err((path, message)) = state.remove_journaled_sources() {
-            push_failure(failures, Some(path), message);
-            return;
-        }
+        drop(work_receiver);
+
+        let mut state = StreamingTransfer::new(
+            plan,
+            events,
+            conflict_resolutions,
+            cancel_requested,
+            completed_items,
+            completed_bytes,
+            completed_files,
+            completed_directories,
+            work_sender,
+            &stopped,
+            &progress,
+            journal.as_deref(),
+        );
         for root in roots {
-            remove_empty_source_directories(&root.source, cancel_requested);
+            if let Err((path, message)) = state.visit(&root.source, &root.target) {
+                if !cancel_requested.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
+                    push_failure(failures, Some(path), message);
+                    stopped.store(true, Ordering::Release);
+                }
+                break;
+            }
         }
-    }
+        progress.scope_complete.store(true, Ordering::Release);
+        state.publish(None);
+        state.close_queue();
+
+        for worker in workers {
+            if worker.join().is_err() {
+                push_failure(
+                    failures,
+                    None,
+                    "A transfer worker stopped unexpectedly".into(),
+                );
+                stopped.store(true, Ordering::Release);
+            }
+        }
+
+        if !stopped.load(Ordering::Acquire) && !cancel_requested.load(Ordering::Acquire) {
+            let directories = progress.total_directories.load(Ordering::Acquire);
+            completed_directories.store(directories, Ordering::Release);
+            completed_items.fetch_add(directories, Ordering::AcqRel);
+            state.publish_phase(JobPhase::Finalizing, None);
+            if remove_sources {
+                if let Err((path, message)) =
+                    remove_journaled_sources(journal.as_deref(), cancel_requested)
+                {
+                    push_failure(failures, Some(path), message);
+                    stopped.store(true, Ordering::Release);
+                    return;
+                }
+                for root in roots {
+                    remove_empty_source_directories(&root.source, cancel_requested);
+                }
+            }
+        }
+    });
 }
 
 struct StreamingTransfer<'a> {
     plan: &'a OperationPlan,
-    verification: VerificationMode,
     events: &'a Sender<OperationEvent>,
     resolutions: &'a Receiver<ConflictResolution>,
     cancelled: &'a AtomicBool,
@@ -256,34 +326,35 @@ struct StreamingTransfer<'a> {
     completed_bytes: &'a AtomicU64,
     completed_files_counter: &'a AtomicU64,
     completed_directories_counter: &'a AtomicU64,
-    total_items: u64,
-    total_files: u64,
-    total_directories: u64,
-    total_bytes: u64,
-    completed_files: u64,
-    completed_directories: u64,
-    scope_complete: bool,
     file_policy: Option<ConflictAction>,
     type_policy: Option<ConflictAction>,
-    journal: Option<File>,
+    work_sender: Option<Sender<PreparedFile>>,
+    stopped: &'a AtomicBool,
+    progress: &'a StreamingProgress,
+    journal: Option<&'a Mutex<File>>,
+    reserved_targets: HashSet<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
-struct StreamProgressSnapshot {
-    total_items: u64,
-    total_files: u64,
-    total_directories: u64,
-    total_bytes: u64,
-    completed_files: u64,
-    completed_directories: u64,
+#[derive(Default)]
+struct StreamingProgress {
+    total_items: AtomicU64,
+    total_files: AtomicU64,
+    total_directories: AtomicU64,
+    total_bytes: AtomicU64,
+    scope_complete: AtomicBool,
+}
+
+struct PreparedFile {
+    task: FileTask,
+    overwrite: bool,
+    remove_source: bool,
+    expected_target: Option<Fingerprint>,
 }
 
 impl<'a> StreamingTransfer<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         plan: &'a OperationPlan,
-        verification: VerificationMode,
-        remove_sources: bool,
         events: &'a Sender<OperationEvent>,
         resolutions: &'a Receiver<ConflictResolution>,
         cancelled: &'a AtomicBool,
@@ -291,18 +362,13 @@ impl<'a> StreamingTransfer<'a> {
         completed_bytes: &'a AtomicU64,
         completed_files: &'a AtomicU64,
         completed_directories: &'a AtomicU64,
-    ) -> Result<Self, String> {
-        let journal =
-            if remove_sources {
-                Some(tempfile::tempfile().map_err(|error| {
-                    format!("Cannot create the temporary move journal: {error}")
-                })?)
-            } else {
-                None
-            };
-        Ok(Self {
+        work_sender: Sender<PreparedFile>,
+        stopped: &'a AtomicBool,
+        progress: &'a StreamingProgress,
+        journal: Option<&'a Mutex<File>>,
+    ) -> Self {
+        Self {
             plan,
-            verification,
             events,
             resolutions,
             cancelled,
@@ -310,21 +376,18 @@ impl<'a> StreamingTransfer<'a> {
             completed_bytes,
             completed_files_counter: completed_files,
             completed_directories_counter: completed_directories,
-            total_items: 0,
-            total_files: 0,
-            total_directories: 0,
-            total_bytes: 0,
-            completed_files: 0,
-            completed_directories: 0,
-            scope_complete: false,
             file_policy: None,
             type_policy: None,
+            work_sender: Some(work_sender),
+            stopped,
+            progress,
             journal,
-        })
+            reserved_targets: HashSet::new(),
+        }
     }
 
     fn visit(&mut self, source: &Path, requested_target: &Path) -> Result<(), (PathBuf, String)> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
             return Err((source.to_path_buf(), "Transfer cancelled".into()));
         }
         let metadata = fs::symlink_metadata(source).map_err(|error| {
@@ -336,19 +399,22 @@ impl<'a> StreamingTransfer<'a> {
         let fingerprint = crate::planner::fingerprint(&metadata)
             .map_err(|message| (source.to_path_buf(), message))?;
         revalidate(source, &fingerprint).map_err(|message| (source.to_path_buf(), message))?;
-        self.total_items += 1;
+        self.progress.total_items.fetch_add(1, Ordering::AcqRel);
         match fingerprint.kind {
             ObjectKind::File => {
-                self.total_files += 1;
-                self.total_bytes = self.total_bytes.saturating_add(fingerprint.len);
+                self.progress.total_files.fetch_add(1, Ordering::AcqRel);
+                self.progress
+                    .total_bytes
+                    .fetch_add(fingerprint.len, Ordering::AcqRel);
                 self.publish(Some(source.to_path_buf()));
                 self.visit_file(source, requested_target, fingerprint)
             }
             ObjectKind::Directory => {
-                self.total_directories += 1;
+                self.progress
+                    .total_directories
+                    .fetch_add(1, Ordering::AcqRel);
                 let Some(target) = self.directory_target(source, requested_target, &fingerprint)?
                 else {
-                    self.complete_directory(source);
                     return Ok(());
                 };
                 let reader = fs::read_dir(source).map_err(|error| {
@@ -366,7 +432,6 @@ impl<'a> StreamingTransfer<'a> {
                     })?;
                     self.visit(&child.path(), &target.join(child.file_name()))?;
                 }
-                self.complete_directory(source);
                 Ok(())
             }
         }
@@ -389,9 +454,17 @@ impl<'a> StreamingTransfer<'a> {
             Ok(metadata) => {
                 let conflict = transfer_conflict(self.plan, source, target, fingerprint, &metadata);
                 match self.resolve(conflict)? {
-                    ConflictAction::KeepBoth => keep_both_target(target, ObjectKind::Directory)
-                        .map(Some)
-                        .map_err(|message| (target.to_path_buf(), message)),
+                    ConflictAction::KeepBoth => {
+                        let allocated =
+                            self.allocate_keep_both_target(target, ObjectKind::Directory)?;
+                        fs::create_dir(&allocated).map_err(|error| {
+                            (
+                                allocated.clone(),
+                                format!("Cannot create conflict copy folder: {error}"),
+                            )
+                        })?;
+                        Ok(Some(allocated))
+                    }
                     ConflictAction::KeepDestination | ConflictAction::Skip => Ok(None),
                     _ => Err((
                         target.to_path_buf(),
@@ -471,10 +544,10 @@ impl<'a> StreamingTransfer<'a> {
                                 _ => unreachable!(),
                             },
                             ConflictAction::KeepBoth => {
-                                let target = keep_both_target(requested_target, ObjectKind::File)
-                                    .map_err(|message| {
-                                    (requested_target.to_path_buf(), message)
-                                })?;
+                                let target = self.allocate_keep_both_target(
+                                    requested_target,
+                                    ObjectKind::File,
+                                )?;
                                 return self.copy_and_record(
                                     source,
                                     target,
@@ -508,8 +581,8 @@ impl<'a> StreamingTransfer<'a> {
                     );
                     match self.resolve(conflict)? {
                         ConflictAction::KeepBoth => {
-                            let target = keep_both_target(requested_target, ObjectKind::File)
-                                .map_err(|message| (requested_target.to_path_buf(), message))?;
+                            let target =
+                                self.allocate_keep_both_target(requested_target, ObjectKind::File)?;
                             return self.copy_and_record(
                                 source,
                                 target,
@@ -559,42 +632,38 @@ impl<'a> StreamingTransfer<'a> {
         remove_source: bool,
         expected_target: Option<&Fingerprint>,
     ) -> Result<(), (PathBuf, String)> {
-        let task = FileTask {
-            source: source.to_path_buf(),
-            target: target.clone(),
-            fingerprint: fingerprint.clone(),
-        };
-        copy_file(
-            &task,
-            self.verification == VerificationMode::Full,
-            overwrite,
-            expected_target,
-            StreamProgressSnapshot {
-                total_items: self.total_items,
-                total_files: self.total_files,
-                total_directories: self.total_directories,
-                total_bytes: self.total_bytes,
-                completed_files: self.completed_files,
-                completed_directories: self.completed_directories,
-            },
-            self.cancelled,
-            self.completed_bytes,
-            self.events,
-            self.plan,
-            self.completed_items,
-        )
-        .map_err(|error| {
-            let message = match error {
-                CopyError::Cancelled => "Transfer cancelled".into(),
-                CopyError::Failed(message) => message,
-            };
-            (source.to_path_buf(), message)
-        })?;
-        if remove_source {
-            self.record_source(source, &fingerprint)?;
+        if !self.reserved_targets.insert(target.clone()) {
+            return Err((
+                target,
+                "Multiple sources map to the same destination path".into(),
+            ));
         }
-        self.complete_file(&target);
-        Ok(())
+        let prepared = PreparedFile {
+            task: FileTask {
+                source: source.to_path_buf(),
+                target,
+                fingerprint,
+            },
+            overwrite,
+            remove_source,
+            expected_target: expected_target.cloned(),
+        };
+        let mut pending = prepared;
+        loop {
+            if self.cancelled.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+                return Err((source.to_path_buf(), "Transfer cancelled".into()));
+            }
+            let Some(sender) = &self.work_sender else {
+                return Err((source.to_path_buf(), "Transfer queue closed".into()));
+            };
+            match sender.send_timeout(pending, std::time::Duration::from_millis(100)) {
+                Ok(()) => return Ok(()),
+                Err(SendTimeoutError::Timeout(returned)) => pending = returned,
+                Err(SendTimeoutError::Disconnected(_)) => {
+                    return Err((source.to_path_buf(), "Transfer queue closed".into()));
+                }
+            }
+        }
     }
 
     fn resolve(&mut self, conflict: TransferConflict) -> Result<ConflictAction, (PathBuf, String)> {
@@ -640,88 +709,178 @@ impl<'a> StreamingTransfer<'a> {
         source: &Path,
         fingerprint: &Fingerprint,
     ) -> Result<(), (PathBuf, String)> {
-        if let Some(journal) = &mut self.journal {
-            write_journal_entry(journal, source, fingerprint).map_err(|error| {
-                (
-                    source.to_path_buf(),
-                    format!("Cannot write move journal: {error}"),
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    fn remove_journaled_sources(&mut self) -> Result<(), (PathBuf, String)> {
-        let Some(journal) = &mut self.journal else {
-            return Ok(());
-        };
-        journal.flush().map_err(|error| {
-            (
-                PathBuf::new(),
-                format!("Cannot flush move journal: {error}"),
-            )
-        })?;
-        journal
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| (PathBuf::new(), format!("Cannot read move journal: {error}")))?;
-        while let Some((source, fingerprint)) = read_journal_entry(journal)
-            .map_err(|error| (PathBuf::new(), format!("Cannot read move journal: {error}")))?
-        {
-            if self.cancelled.load(Ordering::Acquire) {
-                return Err((
-                    source,
-                    "Move cancelled before source cleanup completed".into(),
-                ));
-            }
-            revalidate(&source, &fingerprint).map_err(|message| (source.clone(), message))?;
-            fs::remove_file(&source).map_err(|error| {
-                (
-                    source.clone(),
-                    format!("Verified copy retained, but source removal failed: {error}"),
-                )
-            })?;
-        }
-        Ok(())
+        record_source(self.journal, source, fingerprint)
     }
 
     fn complete_file(&mut self, path: &Path) {
-        self.completed_files += 1;
         self.completed_files_counter.fetch_add(1, Ordering::AcqRel);
         self.completed_items.fetch_add(1, Ordering::AcqRel);
         self.publish(Some(path.to_path_buf()));
     }
 
-    fn complete_directory(&mut self, path: &Path) {
-        self.completed_directories += 1;
-        self.completed_directories_counter
-            .fetch_add(1, Ordering::AcqRel);
-        self.completed_items.fetch_add(1, Ordering::AcqRel);
-        self.publish(Some(path.to_path_buf()));
+    fn allocate_keep_both_target(
+        &self,
+        requested: &Path,
+        kind: ObjectKind,
+    ) -> Result<PathBuf, (PathBuf, String)> {
+        keep_both_target(requested, kind, &self.reserved_targets)
+            .map_err(|message| (requested.to_path_buf(), message))
+    }
+
+    fn close_queue(&mut self) {
+        self.work_sender.take();
     }
 
     fn publish(&self, current_path: Option<PathBuf>) {
+        self.publish_phase(JobPhase::Running, current_path);
+    }
+
+    fn publish_phase(&self, phase: JobPhase, current_path: Option<PathBuf>) {
         let _ = self
             .events
             .try_send(OperationEvent::Progress(OperationProgress {
                 job: self.plan.summary.job,
                 kind: self.plan.summary.kind,
-                phase: if self.scope_complete {
-                    JobPhase::Finalizing
-                } else {
-                    JobPhase::Running
-                },
+                phase,
                 completed_items: self.completed_items.load(Ordering::Acquire),
-                total_items: self.total_items,
-                completed_files: self.completed_files,
-                total_files: self.total_files,
-                completed_directories: self.completed_directories,
-                total_directories: self.total_directories,
+                total_items: self.progress.total_items.load(Ordering::Acquire),
+                completed_files: self.completed_files_counter.load(Ordering::Acquire),
+                total_files: self.progress.total_files.load(Ordering::Acquire),
+                completed_directories: self.completed_directories_counter.load(Ordering::Acquire),
+                total_directories: self.progress.total_directories.load(Ordering::Acquire),
                 completed_bytes: self.completed_bytes.load(Ordering::Acquire),
-                total_bytes: self.total_bytes,
-                scope_complete: self.scope_complete,
+                total_bytes: self.progress.total_bytes.load(Ordering::Acquire),
+                scope_complete: self.progress.scope_complete.load(Ordering::Acquire),
                 current_path,
             }));
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_worker(
+    receiver: Receiver<PreparedFile>,
+    verification: VerificationMode,
+    events: &Sender<OperationEvent>,
+    plan: &OperationPlan,
+    cancelled: &AtomicBool,
+    completed_items: &AtomicU64,
+    completed_bytes: &AtomicU64,
+    completed_files: &AtomicU64,
+    completed_directories: &AtomicU64,
+    failures: &Mutex<Vec<OperationFailure>>,
+    stopped: &AtomicBool,
+    progress: &StreamingProgress,
+    journal: Option<&Mutex<File>>,
+) {
+    while let Ok(prepared) = receiver.recv() {
+        if cancelled.load(Ordering::Acquire) || stopped.load(Ordering::Acquire) {
+            continue;
+        }
+        let result = copy_file(
+            &prepared.task,
+            verification == VerificationMode::Full,
+            prepared.overwrite,
+            prepared.expected_target.as_ref(),
+            progress,
+            cancelled,
+            completed_bytes,
+            completed_files,
+            completed_directories,
+            events,
+            plan,
+            completed_items,
+        );
+        if let Err(error) = result {
+            let message = match error {
+                CopyError::Cancelled => "Transfer cancelled".into(),
+                CopyError::Failed(message) => message,
+            };
+            if !cancelled.load(Ordering::Acquire) {
+                push_failure(failures, Some(prepared.task.source.clone()), message);
+            }
+            stopped.store(true, Ordering::Release);
+            continue;
+        }
+        if prepared.remove_source
+            && let Err((path, message)) =
+                record_source(journal, &prepared.task.source, &prepared.task.fingerprint)
+        {
+            push_failure(failures, Some(path), message);
+            stopped.store(true, Ordering::Release);
+            continue;
+        }
+        completed_files.fetch_add(1, Ordering::AcqRel);
+        completed_items.fetch_add(1, Ordering::AcqRel);
+        send_stream_progress(
+            events,
+            plan,
+            JobPhase::Running,
+            Some(prepared.task.target),
+            progress,
+            completed_items,
+            completed_bytes,
+            completed_files,
+            completed_directories,
+        );
+    }
+}
+
+fn record_source(
+    journal: Option<&Mutex<File>>,
+    source: &Path,
+    fingerprint: &Fingerprint,
+) -> Result<(), (PathBuf, String)> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let mut journal = journal
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    write_journal_entry(&mut journal, source, fingerprint).map_err(|error| {
+        (
+            source.to_path_buf(),
+            format!("Cannot write move journal: {error}"),
+        )
+    })
+}
+
+fn remove_journaled_sources(
+    journal: Option<&Mutex<File>>,
+    cancelled: &AtomicBool,
+) -> Result<(), (PathBuf, String)> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let mut journal = journal
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    journal.flush().map_err(|error| {
+        (
+            PathBuf::new(),
+            format!("Cannot flush move journal: {error}"),
+        )
+    })?;
+    journal
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| (PathBuf::new(), format!("Cannot read move journal: {error}")))?;
+    while let Some((source, fingerprint)) = read_journal_entry(&mut journal)
+        .map_err(|error| (PathBuf::new(), format!("Cannot read move journal: {error}")))?
+    {
+        if cancelled.load(Ordering::Acquire) {
+            return Err((
+                source,
+                "Move cancelled before source cleanup completed".into(),
+            ));
+        }
+        revalidate(&source, &fingerprint).map_err(|message| (source.clone(), message))?;
+        fs::remove_file(&source).map_err(|error| {
+            (
+                source.clone(),
+                format!("Verified copy retained, but source removal failed: {error}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn transfer_conflict(
@@ -888,9 +1047,11 @@ fn copy_file(
     verify_hash: bool,
     overwrite: bool,
     expected_target: Option<&Fingerprint>,
-    stream: StreamProgressSnapshot,
+    progress: &StreamingProgress,
     cancel_requested: &AtomicBool,
     completed_bytes: &AtomicU64,
+    completed_files: &AtomicU64,
+    completed_directories: &AtomicU64,
     events: &Sender<OperationEvent>,
     plan: &OperationPlan,
     completed_items: &AtomicU64,
@@ -901,9 +1062,11 @@ fn copy_file(
         verify_hash,
         overwrite,
         expected_target,
-        stream,
+        progress,
         cancel_requested,
         completed_bytes,
+        completed_files,
+        completed_directories,
         events,
         plan,
         completed_items,
@@ -921,9 +1084,11 @@ fn copy_file_inner(
     verify_hash: bool,
     overwrite: bool,
     expected_target: Option<&Fingerprint>,
-    stream: StreamProgressSnapshot,
+    progress: &StreamingProgress,
     cancel_requested: &AtomicBool,
     completed_bytes: &AtomicU64,
+    completed_files: &AtomicU64,
+    completed_directories: &AtomicU64,
     events: &Sender<OperationEvent>,
     plan: &OperationPlan,
     completed_items: &AtomicU64,
@@ -959,15 +1124,17 @@ fn copy_file_inner(
         }
         let count = count as u64;
         *local_bytes += count;
-        let bytes = completed_bytes.fetch_add(count, Ordering::AcqRel) + count;
+        completed_bytes.fetch_add(count, Ordering::AcqRel);
         send_stream_progress(
             events,
             plan,
             JobPhase::Running,
-            completed_items.load(Ordering::Acquire),
-            bytes,
             Some(task.source.clone()),
-            stream,
+            progress,
+            completed_items,
+            completed_bytes,
+            completed_files,
+            completed_directories,
         );
     }
 
@@ -987,10 +1154,12 @@ fn copy_file_inner(
             events,
             plan,
             JobPhase::Verifying,
-            completed_items.load(Ordering::Acquire),
-            completed_bytes.load(Ordering::Acquire),
             Some(task.target.clone()),
-            stream,
+            progress,
+            completed_items,
+            completed_bytes,
+            completed_files,
+            completed_directories,
         );
         temporary
             .as_file_mut()
@@ -1238,28 +1407,31 @@ fn send_progress(
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_stream_progress(
     events: &Sender<OperationEvent>,
     plan: &OperationPlan,
     phase: JobPhase,
-    completed_items: u64,
-    completed_bytes: u64,
     current_path: Option<PathBuf>,
-    stream: StreamProgressSnapshot,
+    progress: &StreamingProgress,
+    completed_items: &AtomicU64,
+    completed_bytes: &AtomicU64,
+    completed_files: &AtomicU64,
+    completed_directories: &AtomicU64,
 ) {
     let _ = events.try_send(OperationEvent::Progress(OperationProgress {
         job: plan.summary.job,
         kind: plan.summary.kind,
         phase,
-        completed_items,
-        total_items: stream.total_items,
-        completed_files: stream.completed_files,
-        total_files: stream.total_files,
-        completed_directories: stream.completed_directories,
-        total_directories: stream.total_directories,
-        completed_bytes,
-        total_bytes: stream.total_bytes,
-        scope_complete: false,
+        completed_items: completed_items.load(Ordering::Acquire),
+        total_items: progress.total_items.load(Ordering::Acquire),
+        completed_files: completed_files.load(Ordering::Acquire),
+        total_files: progress.total_files.load(Ordering::Acquire),
+        completed_directories: completed_directories.load(Ordering::Acquire),
+        total_directories: progress.total_directories.load(Ordering::Acquire),
+        completed_bytes: completed_bytes.load(Ordering::Acquire),
+        total_bytes: progress.total_bytes.load(Ordering::Acquire),
+        scope_complete: progress.scope_complete.load(Ordering::Acquire),
         current_path,
     }));
 }
