@@ -45,7 +45,7 @@ fn main() -> AppResult<()> {
     let folder_sizes = FolderSizeScanner::new();
     let previews = PreviewLoader::new();
     let operations = OperationEngine::new();
-    queue_initial_scans(&mut app, &scanner);
+    queue_initial_drive_scans(&mut app, &scanner);
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -159,16 +159,15 @@ fn sync_folder_size(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
     });
 }
 
-fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner) {
+fn queue_initial_drive_scans(app: &mut AppState, scanner: &DirectoryScanner) {
     for pane_id in PaneId::ALL {
-        let pane = app.pane(pane_id);
+        let generation = app.pane_mut(pane_id).begin_drive_list();
         let request = ScanRequest {
             pane: pane_id,
-            generation: pane.generation,
-            location: ScanLocation::Directory(pane.location.clone()),
+            generation,
+            location: ScanLocation::Drives,
         };
         if let Err(error) = scanner.request(request) {
-            let generation = app.pane(pane_id).generation;
             app.pane_mut(pane_id)
                 .apply_error(generation, request_error_message(error));
         }
@@ -1401,6 +1400,21 @@ mod preview_tests {
         FileEntry, PreviewCompleteness, PreviewDocument, PreviewEncoding, PreviewKind, PreviewLine,
         PreviewLineStyle,
     };
+
+    #[test]
+    fn startup_places_both_panes_in_the_all_drives_view() {
+        let scanner = DirectoryScanner::new();
+        let mut app = AppState::new(PathBuf::from("left"), PathBuf::from("right"));
+
+        queue_initial_drive_scans(&mut app, &scanner);
+
+        for pane_id in PaneId::ALL {
+            let pane = app.pane(pane_id);
+            assert!(pane.browsing_drives);
+            assert!(matches!(pane.load_state, LoadState::Loading));
+            assert_eq!(pane.generation, 1);
+        }
+    }
 
     fn app_with_focused_file() -> AppState {
         let root = PathBuf::from(r"C:\preview-route-test");
