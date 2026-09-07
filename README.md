@@ -1,6 +1,6 @@
 # DirVeyor
 
-> Directory + Surveyor: know what is moving and where it is going.
+> Directory Surveyor: know what is moving and where it is going.
 
 DirVeyor is a Rust terminal application for fast, understandable file
 management. It combines a keyboard-first two-pane browser with an explicit
