@@ -96,13 +96,14 @@ Executable and presentation layer:
 Reviewed operation planner and executor:
 
 - a single bounded coordinator and at most two copy workers;
-- immutable plan summaries with exact item/file/byte counts, strategy, warnings,
-  and conflict resolutions;
+- immutable plan summaries with exact copy/move counts or explicitly labeled
+  top-level delete scope, strategy, warnings, and conflict resolutions;
 - root, overlap, self-descendant, link/reparse, special-file, and plan-size guards;
 - no-overwrite copy publication through temporary files;
 - Windows same-volume native no-replace moves;
 - cross-volume copy, SHA-256 verification, then frozen-source removal;
 - platform Recycle Bin / Trash integration with no permanent-delete fallback;
+- opt-in permanent deletion with a typed `DELETE` confirmation;
 - source revalidation after review and cancellation at safe boundaries.
 
 ## Scan lifecycle
@@ -134,9 +135,11 @@ Windows hidden attributes are not yet considered.
 
 1. The UI captures the active pane's selected items, or its focused item when
    nothing is selected. Copy and move take the other open pane as destination.
-2. The coordinator enumerates a frozen manifest and returns a summary. No
-   mutation occurs during this phase.
+2. Copy and move enumerate a frozen manifest. Delete plans snapshot only the
+   selected roots so an inaccessible descendant cannot block the operating
+   system's recycle/delete facility. No mutation occurs during planning.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
+   Permanent deletion additionally requires typing `DELETE`.
 4. The executor revalidates source identity, performs the planned strategy, and
    reports bounded progress. Cancellation stops before the next safe step.
 5. The UI displays a durable outcome and refreshes affected visible panes.
@@ -148,6 +151,8 @@ Windows hidden attributes are not yet considered.
 - No operation executes before explicit plan approval.
 - Existing destinations are not overwritten.
 - Failed Recycle Bin / Trash operations never fall back to permanent deletion.
+- Permanent deletion is a separate, visibly red mode selected with `Ctrl+D`;
+  directory failures may be partial and are reported as such.
 - Cross-volume move sources remain until copied files pass SHA-256 verification.
 - Sources are revalidated after review before mutation.
 - Directory work runs outside the rendering/input loop.
@@ -159,6 +164,14 @@ Windows hidden attributes are not yet considered.
 - Focus and selection have independent visual and state representations.
 - User-folder and Favorite rows are non-selectable virtual locations, so they
   can navigate a pane but can never become filesystem-operation sources.
+
+On Windows, a permission-denied delete result offers elevation only when the
+current process is not already elevated. `Ctrl+E` invokes the operating-system
+`runas` flow and starts a new FileAdmin process at the current pane locations;
+it never executes the failed operation automatically. The user must plan and
+approve the operation again in the elevated process. If an elevated process is
+still denied, the UI points to ownership, access-control, or filesystem-health
+investigation rather than requesting redundant elevation.
 
 ## Quick access and Favorites
 

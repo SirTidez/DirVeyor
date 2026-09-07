@@ -156,7 +156,8 @@ notification that never hides errors.
 | `/` | Filter current pane | Filter jobs |
 | `C` | Review copy | Cancel filter / contextual action |
 | `M` | Review move | Move/reprioritize job |
-| `D` | Review delete | Remove completed entry |
+| `D` | Review using the current delete mode | Remove completed entry |
+| `Ctrl+D` | Toggle recycle/permanent mode | — |
 | `R` | Rename | Retry failed subset |
 | `P` | Preview focused text file | Pause or resume |
 | `F` / `Ctrl+F` | Toggle favorite / open Favorites | — |
@@ -178,6 +179,9 @@ Intent -> Plan -> Scan -> Review if needed -> Queue -> Transfer
   conflicts detectable up front, capacity estimates, and recovery options.
 - **Scan** enumerates enough work to present scope; very large trees may stream
   additional discoveries while clearly showing that totals are still growing.
+- **Delete scan** may snapshot only selected roots and label recursive totals as
+  unknown when enumeration would prevent the platform delete API from handling
+  an otherwise removable directory.
 - **Review** is mandatory for destructive or ambiguous plans.
 - **Transfer** emits monotonic byte and item counters from actual completed I/O.
 - **Verify** is independently visible and never counted as copying.
@@ -230,6 +234,12 @@ mode to tune the policy.
 - Preserve metadata on a documented best-effort basis and report exceptions.
 - Make cancellation cooperative and document the last safe cancellation point.
 - Never silently overwrite a destination under the default policy.
+- Keep recycle and permanent deletion as distinct modes. Permanent deletion
+  requires a typed confirmation and must warn that a directory failure can be
+  partial.
+- Offer Windows elevation only after a permission-denied delete failure and
+  only from a non-elevated process. A new elevated process must require a fresh
+  plan and review rather than replaying the failed operation automatically.
 - Protect logs from control-character injection and redact credentials embedded
   in network paths.
 - Treat archive extraction as out of scope until path traversal and resource
@@ -329,8 +339,7 @@ can be finalized.
 - Scope and semantics of trash/recycle integration.
 - Mouse support and preview plug-ins beyond the built-in text preview.
 - Remote protocols beyond mounted filesystems.
-- Whether elevated operations are delegated to a small platform helper or left
-  to relaunch/manual workflows.
+- Non-Windows elevation workflows beyond the implemented Windows relaunch path.
 
 ## 17. First usability questions
 
