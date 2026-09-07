@@ -1,8 +1,10 @@
 //! Read-only filesystem scanning on bounded background workers.
 
 mod folder_size;
+mod preview;
 
 pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner, FolderSizeUpdate};
+pub use preview::{PreviewEvent, PreviewLoader};
 
 use fileadmin_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
 use std::fs;

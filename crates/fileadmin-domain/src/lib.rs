@@ -1,8 +1,10 @@
 //! Pure state used by the FileAdmin UI and filesystem adapters.
 
 mod operation;
+mod preview;
 
 pub use operation::*;
+pub use preview::*;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -389,6 +391,7 @@ pub struct AppState {
     pub operation: OperationView,
     pub text_prompt: Option<TextPrompt>,
     pub folder_size: FolderSizeState,
+    pub preview: PreviewState,
 }
 
 impl AppState {
@@ -398,11 +401,14 @@ impl AppState {
             active_pane: PaneId::Left,
             help_visible: false,
             filter_mode: false,
-            notice: Some("Ready · c Copy · m Move · d Recycle · r Rename · n New folder".into()),
+            notice: Some(
+                "Ready · p Preview · c Copy · m Move · d Recycle · r Rename · n New folder".into(),
+            ),
             should_quit: false,
             operation: OperationView::Idle,
             text_prompt: None,
             folder_size: FolderSizeState::Idle,
+            preview: PreviewState::Closed,
         }
     }
 

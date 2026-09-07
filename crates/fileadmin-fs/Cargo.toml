@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 fileadmin-domain = { path = "../fileadmin-domain" }
+pulldown-cmark.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
