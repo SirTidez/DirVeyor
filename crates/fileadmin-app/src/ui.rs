@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::{OffsetDateTime, UtcOffset};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MIN_WIDTH: u16 = 80;
@@ -316,12 +317,27 @@ fn append_folder_size_details(
     focused_path: &std::path::Path,
 ) {
     match state {
-        FolderSizeState::Loading { path, .. } if path == focused_path => {
+        FolderSizeState::Loading(progress) if progress.path == focused_path => {
             lines.push(Line::styled(
-                "Contained size: Calculating…",
+                format!(
+                    "{} Contained size: {} so far",
+                    folder_size_spinner(),
+                    human_size(progress.discovered_bytes)
+                ),
                 Style::default().fg(Color::Cyan),
             ));
-            lines.push(Line::raw("Drive share: Calculating…"));
+            lines.push(Line::raw(match progress.drive_total_bytes {
+                Some(total) => format!(
+                    "Drive share: {} so far",
+                    drive_share_label(progress.discovered_bytes, Some(total))
+                ),
+                None => "Drive share: Discovering…".into(),
+            }));
+            lines.push(Line::raw(format!(
+                "Scanned: {} files · {} folders",
+                progress.file_count,
+                progress.directory_count.saturating_sub(1)
+            )));
         }
         FolderSizeState::Ready(summary) if summary.path == focused_path => {
             lines.push(Line::raw(format!(
@@ -362,6 +378,15 @@ fn append_folder_size_details(
             lines.push(Line::raw("Drive share: Waiting…"));
         }
     }
+}
+
+fn folder_size_spinner() -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() / 150)
+        .unwrap_or(0);
+    FRAMES[(tick as usize) % FRAMES.len()]
 }
 
 fn drive_share_label(folder_bytes: u64, drive_total_bytes: Option<u64>) -> String {
@@ -995,10 +1020,46 @@ fn modified_label(modified: Option<SystemTime>) -> String {
     let Some(modified) = modified else {
         return "—".into();
     };
-    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
-        return "Before 1970".into();
+    let utc = OffsetDateTime::from(modified);
+    match UtcOffset::current_local_offset() {
+        Ok(offset) => format_datetime(utc.to_offset(offset), ""),
+        Err(_) => format_datetime(utc, " UTC"),
+    }
+}
+
+fn format_datetime(date_time: OffsetDateTime, suffix: &str) -> String {
+    let hour = date_time.hour();
+    let (hour, period) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
     };
-    format!("Unix {}", duration.as_secs())
+    format!(
+        "{} {}, {} · {}:{:02} {period}{suffix}",
+        month_label(date_time.month()),
+        date_time.day(),
+        date_time.year(),
+        hour,
+        date_time.minute(),
+    )
+}
+
+fn month_label(month: time::Month) -> &'static str {
+    match month {
+        time::Month::January => "Jan",
+        time::Month::February => "Feb",
+        time::Month::March => "Mar",
+        time::Month::April => "Apr",
+        time::Month::May => "May",
+        time::Month::June => "Jun",
+        time::Month::July => "Jul",
+        time::Month::August => "Aug",
+        time::Month::September => "Sep",
+        time::Month::October => "Oct",
+        time::Month::November => "Nov",
+        time::Month::December => "Dec",
+    }
 }
 
 #[cfg(test)]
@@ -1224,5 +1285,42 @@ mod tests {
         );
         assert_eq!(drive_share_label(0, Some(1_024)), "0% of 1.0 KB");
         assert_eq!(drive_share_label(1, None), "Unavailable");
+    }
+
+    #[test]
+    fn folder_size_progress_renders_live_counts_and_discovered_size() {
+        let mut app = populated_app();
+        let folder_path = PathBuf::from("left").join("folder");
+        app.pane_mut(PaneId::Left).entries = vec![FileEntry {
+            path: folder_path.clone(),
+            display_name: "folder".into(),
+            kind: EntryKind::Directory,
+            size: None,
+            modified: None,
+            metadata_incomplete: false,
+            drive_info: None,
+        }];
+        app.folder_size = FolderSizeState::Loading(fileadmin_domain::FolderSizeProgress {
+            request_id: 9,
+            pane: PaneId::Left,
+            generation: 0,
+            path: folder_path,
+            discovered_bytes: 524_288,
+            file_count: 120,
+            directory_count: 8,
+            skipped_items: 0,
+            drive_total_bytes: Some(1_073_741_824),
+        });
+
+        let screen = rendered_screen(&app, 160, 35);
+        assert!(screen.contains("Contained size: 512 KB so far"));
+        assert!(screen.contains("Drive share: 0.049% of 1.0 GB so far"));
+        assert!(screen.contains("Scanned: 120 files · 7 folders"));
+    }
+
+    #[test]
+    fn modified_time_uses_a_human_readable_calendar_format() {
+        let epoch = OffsetDateTime::from_unix_timestamp(0).unwrap();
+        assert_eq!(format_datetime(epoch, " UTC"), "Jan 1, 1970 · 12:00 AM UTC");
     }
 }

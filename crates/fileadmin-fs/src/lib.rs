@@ -2,7 +2,7 @@
 
 mod folder_size;
 
-pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner};
+pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner, FolderSizeUpdate};
 
 use fileadmin_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
 use std::fs;

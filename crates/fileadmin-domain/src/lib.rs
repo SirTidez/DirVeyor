@@ -102,14 +102,22 @@ pub struct FolderSizeSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderSizeProgress {
+    pub request_id: u64,
+    pub pane: PaneId,
+    pub generation: u64,
+    pub path: PathBuf,
+    pub discovered_bytes: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub skipped_items: u64,
+    pub drive_total_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FolderSizeState {
     Idle,
-    Loading {
-        request_id: u64,
-        pane: PaneId,
-        generation: u64,
-        path: PathBuf,
-    },
+    Loading(FolderSizeProgress),
     Ready(FolderSizeSummary),
     Failed {
         request_id: u64,
@@ -124,13 +132,10 @@ impl FolderSizeState {
     pub fn matches(&self, pane: PaneId, generation: u64, path: &Path) -> bool {
         match self {
             Self::Idle => false,
-            Self::Loading {
-                pane: state_pane,
-                generation: state_generation,
-                path: state_path,
-                ..
+            Self::Loading(progress) => {
+                progress.pane == pane && progress.generation == generation && progress.path == path
             }
-            | Self::Failed {
+            Self::Failed {
                 pane: state_pane,
                 generation: state_generation,
                 path: state_path,

@@ -267,6 +267,7 @@ dependencies = [
  "fileadmin-engine",
  "fileadmin-fs",
  "ratatui",
+ "time",
  "unicode-width",
 ]
 

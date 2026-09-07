@@ -5,12 +5,16 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fileadmin_domain::{AppState, EntryKind, FolderSizeState, LoadState, PaneId, parent_or_same};
+use fileadmin_domain::{
+    AppState, EntryKind, FolderSizeProgress, FolderSizeState, LoadState, PaneId, parent_or_same,
+};
 use fileadmin_domain::{
     JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
-use fileadmin_fs::{DirectoryScanner, FolderSizeScanner, RequestError, ScanLocation, ScanRequest};
+use fileadmin_fs::{
+    DirectoryScanner, FolderSizeScanner, FolderSizeUpdate, RequestError, ScanLocation, ScanRequest,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::error::Error;
@@ -72,22 +76,19 @@ fn drain_folder_size_events(app: &mut AppState, folder_sizes: &FolderSizeScanner
     while let Ok(event) = folder_sizes.try_recv() {
         let is_current = matches!(
             &app.folder_size,
-            FolderSizeState::Loading {
-                request_id,
-                pane,
-                generation,
-                path,
-            } if *request_id == event.request_id
-                && *pane == event.pane
-                && *generation == event.generation
-                && *path == event.path
+            FolderSizeState::Loading(progress)
+                if progress.request_id == event.request_id
+                    && progress.pane == event.pane
+                    && progress.generation == event.generation
+                    && progress.path == event.path
         );
         if !is_current {
             continue;
         }
-        app.folder_size = match event.result {
-            Ok(summary) => FolderSizeState::Ready(summary),
-            Err(message) => FolderSizeState::Failed {
+        app.folder_size = match event.update {
+            FolderSizeUpdate::Progress(progress) => FolderSizeState::Loading(progress),
+            FolderSizeUpdate::Finished(Ok(summary)) => FolderSizeState::Ready(summary),
+            FolderSizeUpdate::Finished(Err(message)) => FolderSizeState::Failed {
                 request_id: event.request_id,
                 pane: event.pane,
                 generation: event.generation,
@@ -127,12 +128,17 @@ fn sync_folder_size(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
     }
 
     let request_id = folder_sizes.request(pane, generation, path.clone());
-    app.folder_size = FolderSizeState::Loading {
+    app.folder_size = FolderSizeState::Loading(FolderSizeProgress {
         request_id,
         pane,
         generation,
         path,
-    };
+        discovered_bytes: 0,
+        file_count: 0,
+        directory_count: 0,
+        skipped_items: 0,
+        drive_total_bytes: None,
+    });
 }
 
 fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner) {
