@@ -572,7 +572,6 @@ fn drain_operation_events(
                 app.operation = OperationView::Planning(progress);
             }
             OperationEvent::PlanReady(summary) => {
-                app.delete_confirmation.clear();
                 app.operation = OperationView::Review(summary);
             }
             OperationEvent::Progress(progress) => {
@@ -585,7 +584,6 @@ fn drain_operation_events(
                 });
             }
             OperationEvent::Finished(report) => {
-                app.delete_confirmation.clear();
                 let outcome = report.outcome;
                 let kind = report.kind;
                 refresh_affected_panes(app, scanner, &report.affected_directories);
@@ -599,7 +597,6 @@ fn drain_operation_events(
                 app.operation = OperationView::Finished(report);
             }
             OperationEvent::Failed { job, kind, message } => {
-                app.delete_confirmation.clear();
                 app.operation = OperationView::Error { job, kind, message };
             }
         }
@@ -615,39 +612,36 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
             }
         }
         OperationView::Review(summary) => match key.code {
-            KeyCode::Enter if summary.kind == OperationKind::PermanentDelete => {
-                if app.delete_confirmation == "DELETE" {
-                    if let Err(error) = operations.approve(summary.job) {
-                        app.notice = Some(submit_error_message(error));
-                    }
-                } else {
-                    app.notice = Some("Type DELETE before confirming permanent deletion".into());
+            KeyCode::Char(character)
+                if summary.kind == OperationKind::PermanentDelete
+                    && character.eq_ignore_ascii_case(&'y')
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Err(error) = operations.approve(summary.job) {
+                    app.notice = Some(submit_error_message(error));
                 }
+            }
+            KeyCode::Char(character)
+                if summary.kind == OperationKind::PermanentDelete
+                    && character.eq_ignore_ascii_case(&'n')
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                abandon_review(app, operations, summary.job);
+            }
+            KeyCode::Enter if summary.kind == OperationKind::PermanentDelete => {
+                app.notice = Some("Press Y to permanently delete or N to cancel".into());
             }
             KeyCode::Enter => {
                 if let Err(error) = operations.approve(summary.job) {
                     app.notice = Some(submit_error_message(error));
                 }
             }
-            KeyCode::Backspace if summary.kind == OperationKind::PermanentDelete => {
-                app.delete_confirmation.pop();
-            }
-            KeyCode::Char(character)
-                if summary.kind == OperationKind::PermanentDelete
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && app.delete_confirmation.len() < 16 =>
-            {
-                app.delete_confirmation.extend(character.to_uppercase());
-            }
             KeyCode::Esc => {
-                let job = summary.job;
-                if operations.abandon(job).is_ok() {
-                    app.operation = OperationView::Idle;
-                    app.delete_confirmation.clear();
-                    app.notice = Some("Operation cancelled; no files changed".into());
-                }
+                abandon_review(app, operations, summary.job);
             }
             _ => {}
         },
@@ -745,6 +739,13 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
             }
         }
         OperationView::Idle => {}
+    }
+}
+
+fn abandon_review(app: &mut AppState, operations: &OperationEngine, job: JobId) {
+    if operations.abandon(job).is_ok() {
+        app.operation = OperationView::Idle;
+        app.notice = Some("Operation cancelled; no files changed".into());
     }
 }
 
@@ -1803,7 +1804,7 @@ mod preview_tests {
     }
 
     #[test]
-    fn permanent_delete_review_requires_the_delete_phrase() {
+    fn permanent_delete_review_uses_yes_and_no_keys() {
         let operations = OperationEngine::new();
         let mut app = app_with_focused_file();
         app.operation = OperationView::Review(PlanSummary {
@@ -1822,24 +1823,27 @@ mod preview_tests {
             verification: None,
         });
 
-        for character in "del".chars() {
-            handle_operation_key(
-                &mut app,
-                &operations,
-                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
-            );
-        }
         handle_operation_key(
             &mut app,
             &operations,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
 
-        assert_eq!(app.delete_confirmation, "DEL");
         assert!(matches!(app.operation, OperationView::Review(_)));
         assert_eq!(
             app.notice.as_deref(),
-            Some("Type DELETE before confirming permanent deletion")
+            Some("Press Y to permanently delete or N to cancel")
+        );
+
+        handle_operation_key(
+            &mut app,
+            &operations,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(matches!(app.operation, OperationView::Idle));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Operation cancelled; no files changed")
         );
     }
 

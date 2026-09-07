@@ -477,7 +477,6 @@ pub struct AppState {
     pub favorites: Vec<PathBuf>,
     pub favorites_panel: Option<FavoritesPanel>,
     pub delete_mode: DeleteMode,
-    pub delete_confirmation: String,
     pub transfer_verification: VerificationMode,
 }
 
@@ -528,7 +527,6 @@ impl AppState {
             favorites: Vec::new(),
             favorites_panel: None,
             delete_mode: DeleteMode::Recycle,
-            delete_confirmation: String::new(),
             transfer_verification: VerificationMode::Full,
         }
     }

@@ -1221,9 +1221,7 @@ fn render_operation(frame: &mut Frame, area: Rect, app: &AppState) {
     match &app.operation {
         OperationView::Idle => {}
         OperationView::Planning(progress) => render_planning(frame, area, progress),
-        OperationView::Review(summary) => {
-            render_review(frame, area, summary, &app.delete_confirmation)
-        }
+        OperationView::Review(summary) => render_review(frame, area, summary),
         OperationView::Running(progress) => render_running(frame, area, progress),
         OperationView::Conflict(prompt) => render_conflict(frame, area, prompt),
         OperationView::Finished(report) => render_finished(frame, area, report),
@@ -1362,7 +1360,7 @@ fn render_planning(
     );
 }
 
-fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_confirmation: &str) {
+fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary) {
     let popup = centered_rect(84, 82, area);
     let mut lines = vec![
         Line::styled(
@@ -1440,32 +1438,35 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_co
     lines.push(Line::raw(""));
     if summary.kind == OperationKind::PermanentDelete {
         lines.push(Line::styled(
-            "Type DELETE to confirm irreversible removal:",
+            "This permanently removes the reviewed items and cannot be undone.",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::styled(
-            format!("Confirmation: {delete_confirmation}_"),
-            Style::default().fg(Color::LightRed),
+            "Y Yes, permanently delete",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            "N No, return without deleting",
+            Style::default().fg(Color::Cyan),
+        ));
+        lines.push(Line::styled(
+            "Esc Back — no files will change",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        lines.push(Line::styled(
+            review_confirmation(summary.kind),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            "Esc Back — no files will change",
+            Style::default().fg(Color::DarkGray),
         ));
     }
-    lines.push(Line::styled(
-        if summary.kind == OperationKind::PermanentDelete && delete_confirmation != "DELETE" {
-            "Enter locked until DELETE is typed"
-        } else {
-            review_confirmation(summary.kind)
-        },
-        Style::default()
-            .fg(if summary.kind == OperationKind::PermanentDelete {
-                Color::Red
-            } else {
-                Color::Cyan
-            })
-            .add_modifier(Modifier::BOLD),
-    ));
-    lines.push(Line::styled(
-        "Esc Back — no files will change",
-        Style::default().fg(Color::DarkGray),
-    ));
     render_modal(
         frame,
         popup,
@@ -1720,7 +1721,7 @@ fn review_confirmation(kind: OperationKind) -> &'static str {
         OperationKind::Copy => "Enter Execute copy",
         OperationKind::Move => "Enter Execute move",
         OperationKind::Recycle => "Enter Move to Recycle Bin / Trash",
-        OperationKind::PermanentDelete => "Enter Permanently delete",
+        OperationKind::PermanentDelete => "Y Permanently delete · N Cancel",
         OperationKind::Rename => "Enter Execute rename",
         OperationKind::CreateDirectory => "Enter Create folder",
     }
@@ -2160,14 +2161,13 @@ mod tests {
     }
 
     #[test]
-    fn permanent_delete_mode_and_phrase_are_unmistakable() {
+    fn permanent_delete_mode_and_yes_no_confirmation_are_unmistakable() {
         let mut app = populated_app();
         app.delete_mode = fileadmin_domain::DeleteMode::Permanent;
         let browse = rendered_screen(&app, 160, 35);
         assert!(browse.contains("D DELETE"));
         assert!(browse.contains("Ctrl+D Mode"));
 
-        app.delete_confirmation = "DEL".into();
         app.operation = OperationView::Review(PlanSummary {
             job: JobId(17),
             kind: OperationKind::PermanentDelete,
@@ -2186,9 +2186,10 @@ mod tests {
 
         let review = rendered_screen(&app, 160, 35);
         assert!(review.contains("Review permanent delete"));
-        assert!(review.contains("Type DELETE to confirm irreversible removal"));
-        assert!(review.contains("Confirmation: DEL_"));
-        assert!(review.contains("Enter locked until DELETE is typed"));
+        assert!(review.contains("cannot be undone"));
+        assert!(review.contains("Y Yes, permanently delete"));
+        assert!(review.contains("N No, return without deleting"));
+        assert!(!review.contains("Type DELETE"));
     }
 
     #[test]
