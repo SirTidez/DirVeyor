@@ -100,9 +100,11 @@ Reviewed operation planner and executor:
   explicitly labeled top-level recycle scope, strategy, warnings, and conflict
   resolutions;
 - root, overlap, self-descendant, link/reparse, special-file, and plan-size guards;
-- no-overwrite copy publication through temporary files;
+- streaming transfer discovery with temporary-file publication and interactive
+  conflict resolution;
 - Windows same-volume native no-replace moves;
-- cross-volume copy, SHA-256 verification, then frozen-source removal;
+- selectable Full SHA-256 or Fast verification, followed by journaled source
+  cleanup for cross-volume moves;
 - platform Recycle Bin / Trash integration with no permanent-delete fallback;
 - opt-in permanent deletion with a typed `DELETE` confirmation;
 - source revalidation after review and cancellation at safe boundaries.
@@ -134,10 +136,11 @@ Windows hidden attributes are not yet considered.
 
 ## Filesystem operation lifecycle
 
-1. The UI captures the active pane's selected items, or its focused item when
-   nothing is selected. Copy and move take the other open pane as destination.
-2. Copy, move, and permanent delete enumerate a frozen manifest. Planning emits
-   live discovered file, folder, and byte counts without mutation. Recycle keeps
+1. A pane with selections remains the marked transfer source when focus moves to
+   the destination. If both panes have selections, the active pane is the source.
+2. Copy and move validate roots and destination, then stream traversal during
+   execution without an in-memory item manifest. Permanent delete freezes an
+   exact manifest during planning. Recycle keeps
    selected-root scope so an inaccessible descendant cannot block the operating
    system's Recycle Bin / Trash facility.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
@@ -157,7 +160,9 @@ Windows hidden attributes are not yet considered.
 - Failed Recycle Bin / Trash operations never fall back to permanent deletion.
 - Permanent deletion is a separate, visibly red mode selected with `Ctrl+D`;
   directory failures may be partial and are reported as such.
-- Cross-volume move sources remain until copied files pass SHA-256 verification.
+- Cross-volume move sources remain until the streamed copy pass completes.
+  Verified source identities are stored in a temporary binary on-disk journal;
+  cleanup revalidates every journal entry before removal.
 - Sources are revalidated after review before mutation.
 - Directory work runs outside the rendering/input loop.
 - Queues and directory snapshots are bounded.

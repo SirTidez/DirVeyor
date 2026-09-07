@@ -186,6 +186,9 @@ Intent -> Plan -> Scan -> Review if needed -> Queue -> Transfer
   removable directory.
 - **Review** is mandatory for destructive or ambiguous plans.
 - **Transfer** emits monotonic byte and item counters from actual completed I/O.
+- **Conflict** identifies source and destination versions, supports keep newer,
+  keep older, keep source, keep destination, keep both, and skip, and scopes
+  Apply-to-all independently by conflict class for the current job.
 - **Verify** is independently visible and never counted as copying.
 - **Finalize** applies metadata, directory timestamps, cleanup, or atomic swaps.
 - **Partial** preserves a manifest of completed, skipped, and failed items.

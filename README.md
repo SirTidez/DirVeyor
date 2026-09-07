@@ -32,9 +32,10 @@ Crossing an edge loads the adjacent window in the background without discarding
 the visible window first. Preview also detects source size or modified-time
 changes and offers an explicit reload instead of silently replacing the view.
 
-Every change is planned first and shown in a confirmation dialog. Existing
-destinations are never overwritten: copy and move conflicts receive numbered
-"Keep both" names, while rename and new-folder conflicts stop safely. Recycle
+Every change is planned first and shown in a confirmation dialog. Copy and move
+stream directory trees without a fixed discovered-item limit. Existing folders
+merge; colliding files pause for a six-choice conflict decision with a separate
+per-job Apply-to-all policy for file conflicts and file/folder type conflicts. Recycle
 uses the operating-system Recycle Bin or Trash and never falls back to permanent
 deletion. Permanent deletion is a separate mode with an additional typed
 confirmation. Its planning screen scans the full tree without changing it, and
@@ -120,8 +121,9 @@ Shift is not required unless a binding explicitly says `Shift`.
 | `P` | Preview the focused human-readable file |
 | `F` | Add or remove the focused folder from Favorites |
 | `Ctrl+F` | Open the dedicated Favorites panel |
-| `C` | Review a copy from the active pane to the other pane |
-| `M` | Review a move from the active pane to the other pane |
+| `C` | Review a copy from the pane marked SOURCE to the pane marked DESTINATION |
+| `M` | Review a move from the pane marked SOURCE to the pane marked DESTINATION |
+| `Ctrl+V` | Switch transfer verification between Full SHA-256 and Fast size/flush checks |
 | `D` or `Delete` | Review deletion using the currently displayed mode |
 | `Ctrl+D` | Switch between Recycle Bin / Trash and permanent deletion |
 | `R` or `F2` | Enter a new name, then review the rename |
@@ -129,6 +131,8 @@ Shift is not required unless a binding explicitly says `Shift`.
 | `Enter` in review | Approve the displayed plan; permanent deletion also requires typing `DELETE` |
 | `Esc` in review | Cancel without changing files |
 | `X`, `C`, or `Esc` while running | Request cancellation at the next safe point |
+| `1`–`6` during a conflict | Keep newer, keep older, keep source, keep destination, keep both, or skip |
+| `A` during a conflict | Apply the decision to all conflicts of the displayed class for this job |
 | `F1` or `?` | Show help |
 | `Q` or `Ctrl+C` | Quit, or request cancellation when a job is active |
 
@@ -170,6 +174,36 @@ last window. `F1` shows the complete preview-specific key guide.
 Favorites persist in FileAdmin's per-user configuration directory and can be
 opened or removed from the `Ctrl+F` panel.
 
+### Large transfers and conflicts
+
+If one pane contains selected items, that pane remains the transfer source even
+when the other pane is active. Pane titles show `SOURCE` and `DESTINATION` with
+an arrow indicating travel direction. If both panes have selections, the active
+pane is the source.
+
+Directories are discovered and transferred incrementally, so million-entry jobs
+do not require a complete in-memory plan. Until discovery finishes, progress is
+indeterminate and reports completed entries, discovered entries, bytes, and the
+current path; it does not invent a final percentage.
+
+For file/file conflicts, FileAdmin displays both full paths, sizes, readable
+modified times, and explicitly identifies the newer side. The choices are Keep
+newer, Keep older, Keep source, Keep destination, Keep both, and Skip. Equal
+timestamp and equal-size files are hashed; identical files need no prompt, while
+different files remain unresolved. Apply-to-all is scoped to the current job and
+stored separately for file/file and type conflicts.
+
+The conflict vocabulary is informed by FileZilla's documented file-exists
+actions, including ask, conditional overwrite, rename, resume, and skip. FileAdmin
+adapts these to local two-pane semantics rather than copying FTP-specific behavior:
+[FileZilla Pro file-exists actions](https://filezillapro.com/docs/v3/advanced/change-default-file-exists-behaviour/).
+
+Full SHA-256 verification is the default. Fast mode still validates source byte
+count, destination size, flush completion, and source stability, but skips the
+destination hash reread. Cross-volume moves complete the copy pass first and
+record verified source files in a compact temporary on-disk journal. Only then
+does source cleanup begin. `Skip` always retains the source.
+
 ## Developer documentation
 
 ### Build and run from source
@@ -204,14 +238,17 @@ cargo build --release --workspace
 ### Current phase and safety boundary
 
 - One operation runs at a time through a bounded background coordinator.
-- Copies use at most two workers and publish through temporary files without
-  replacing an existing destination.
-- Windows same-volume moves use a native no-replace rename. Other moves copy,
-  SHA-256 verify, and only then remove the frozen source tree.
+- Transfers stream directory entries with bounded memory and publish through
+  temporary files. Explicit Keep source/newer/older decisions may atomically
+  replace a revalidated destination file.
+- Windows same-volume moves with a clear destination use a native no-replace
+  rename. Other moves stream-copy, verify using the selected mode, journal
+  verified sources on disk, and only then remove those sources.
 - Filesystem roots, overlapping selections, links, junctions, reparse points,
   special files, and self-descendant transfers are rejected.
-- A plan is capped at 1,000 top-level selections and 100,000 discovered items.
-  Delete plans count selected roots without recursively enumerating contents.
+- A plan is capped at 1,000 top-level selections. The 100,000-entry manifest
+  safety limit applies to permanent deletion, not copy or move. Recycle plans
+  remain selected-root scoped.
 - Capacity preflight, pause/resume, persistent queues, undo, and link-aware
   operations are not implemented yet.
 - Automated checks cover planning, state, rendering, and read-only scanning.
