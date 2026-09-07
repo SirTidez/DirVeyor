@@ -141,7 +141,7 @@ fn coordinator(
             Command::Plan { job, intent } => {
                 let kind = intent.kind();
                 let _ = events.send(OperationEvent::Planning { job, kind });
-                match planner::build_plan(job, intent) {
+                match planner::build_plan(job, intent, &cancel_requested) {
                     Ok(plan) => {
                         let _ = events.send(OperationEvent::PlanReady(plan.summary.clone()));
                         pending = Some(plan);

@@ -4,6 +4,7 @@ use fileadmin_domain::{
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 const MAX_PLAN_ITEMS: usize = 100_000;
@@ -75,19 +76,28 @@ pub(crate) struct OperationPlan {
     pub affected_directories: Vec<PathBuf>,
 }
 
-pub(crate) fn build_plan(job: JobId, intent: OperationIntent) -> Result<OperationPlan, String> {
+pub(crate) fn build_plan(
+    job: JobId,
+    intent: OperationIntent,
+    cancelled: &AtomicBool,
+) -> Result<OperationPlan, String> {
+    check_cancelled(cancelled)?;
     match intent {
         OperationIntent::Copy {
             sources,
             destination,
-        } => build_transfer(job, OperationKind::Copy, sources, destination),
+        } => build_transfer(job, OperationKind::Copy, sources, destination, cancelled),
         OperationIntent::Move {
             sources,
             destination,
-        } => build_transfer(job, OperationKind::Move, sources, destination),
-        OperationIntent::Recycle { sources } => build_recycle(job, sources),
-        OperationIntent::Rename { source, new_name } => build_rename(job, source, new_name),
-        OperationIntent::CreateDirectory { parent, name } => build_mkdir(job, parent, name),
+        } => build_transfer(job, OperationKind::Move, sources, destination, cancelled),
+        OperationIntent::Recycle { sources } => build_recycle(job, sources, cancelled),
+        OperationIntent::Rename { source, new_name } => {
+            build_rename(job, source, new_name, cancelled)
+        }
+        OperationIntent::CreateDirectory { parent, name } => {
+            build_mkdir(job, parent, name, cancelled)
+        }
     }
 }
 
@@ -96,7 +106,9 @@ fn build_transfer(
     kind: OperationKind,
     sources: Vec<PathBuf>,
     destination: PathBuf,
+    cancelled: &AtomicBool,
 ) -> Result<OperationPlan, String> {
+    check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
     let destination_metadata = fs::symlink_metadata(&destination)
         .map_err(|error| format!("Cannot inspect destination: {error}"))?;
@@ -116,6 +128,7 @@ fn build_transfer(
     let mut affected = vec![destination.clone()];
 
     for source in &sources {
+        check_cancelled(cancelled)?;
         let metadata = fs::symlink_metadata(source)
             .map_err(|error| format!("Cannot inspect source {}: {error}", source.display()))?;
         reject_mutation_root(source)?;
@@ -159,6 +172,7 @@ fn build_transfer(
             &mut item_count,
             &mut file_count,
             &mut total_bytes,
+            cancelled,
         )?;
         all_same_volume &= same_volume(source, &destination)?;
         if let Some(parent) = source.parent() {
@@ -222,7 +236,12 @@ fn build_transfer(
     })
 }
 
-fn build_recycle(job: JobId, sources: Vec<PathBuf>) -> Result<OperationPlan, String> {
+fn build_recycle(
+    job: JobId,
+    sources: Vec<PathBuf>,
+    cancelled: &AtomicBool,
+) -> Result<OperationPlan, String> {
+    check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
     let mut snapshots = Vec::with_capacity(sources.len());
     let mut item_count = 0_u64;
@@ -231,6 +250,7 @@ fn build_recycle(job: JobId, sources: Vec<PathBuf>) -> Result<OperationPlan, Str
     let mut affected = Vec::new();
 
     for source in &sources {
+        check_cancelled(cancelled)?;
         reject_mutation_root(source)?;
         let metadata = fs::symlink_metadata(source)
             .map_err(|error| format!("Cannot inspect source {}: {error}", source.display()))?;
@@ -247,6 +267,7 @@ fn build_recycle(job: JobId, sources: Vec<PathBuf>) -> Result<OperationPlan, Str
             &mut item_count,
             &mut file_count,
             &mut total_bytes,
+            cancelled,
         )?;
         snapshots.push((source.clone(), source_fingerprint, item_count - before));
         if let Some(parent) = source.parent() {
@@ -277,7 +298,13 @@ fn build_recycle(job: JobId, sources: Vec<PathBuf>) -> Result<OperationPlan, Str
     })
 }
 
-fn build_rename(job: JobId, source: PathBuf, new_name: OsString) -> Result<OperationPlan, String> {
+fn build_rename(
+    job: JobId,
+    source: PathBuf,
+    new_name: OsString,
+    cancelled: &AtomicBool,
+) -> Result<OperationPlan, String> {
+    check_cancelled(cancelled)?;
     reject_mutation_root(&source)?;
     validate_leaf_name(&new_name)?;
     let metadata = fs::symlink_metadata(&source)
@@ -321,7 +348,13 @@ fn build_rename(job: JobId, source: PathBuf, new_name: OsString) -> Result<Opera
     })
 }
 
-fn build_mkdir(job: JobId, parent: PathBuf, name: OsString) -> Result<OperationPlan, String> {
+fn build_mkdir(
+    job: JobId,
+    parent: PathBuf,
+    name: OsString,
+    cancelled: &AtomicBool,
+) -> Result<OperationPlan, String> {
+    check_cancelled(cancelled)?;
     validate_leaf_name(&name)?;
     let metadata = fs::symlink_metadata(&parent)
         .map_err(|error| format!("Cannot inspect parent directory: {error}"))?;
@@ -388,7 +421,9 @@ fn collect_tree(
     item_count: &mut u64,
     file_count: &mut u64,
     total_bytes: &mut u64,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
+    check_cancelled(cancelled)?;
     if directories.len() + files.len() >= MAX_PLAN_ITEMS {
         return Err(format!(
             "The operation exceeds the current {MAX_PLAN_ITEMS}-item safety limit"
@@ -439,11 +474,20 @@ fn collect_tree(
                     item_count,
                     file_count,
                     total_bytes,
+                    cancelled,
                 )?;
             }
         }
     }
     Ok(())
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Acquire) {
+        Err("Planning cancelled; no files changed".into())
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn fingerprint(metadata: &Metadata) -> Result<Fingerprint, String> {
@@ -621,15 +665,11 @@ fn same_volume(source: &Path, destination: &Path) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn same_volume(source: &Path, destination: &Path) -> Result<bool, String> {
-    use std::os::unix::fs::MetadataExt;
-    let source_device = fs::symlink_metadata(source)
-        .map_err(|error| format!("Cannot inspect source device: {error}"))?
-        .dev();
-    let destination_device = fs::symlink_metadata(destination)
-        .map_err(|error| format!("Cannot inspect destination device: {error}"))?
-        .dev();
-    Ok(source_device == destination_device)
+fn same_volume(_source: &Path, _destination: &Path) -> Result<bool, String> {
+    // The current atomic directory-move implementation uses Windows APIs.
+    // Other platforms take the verified copy/remove path until renameat2-style
+    // no-replace publication is implemented for both files and directories.
+    Ok(false)
 }
 
 #[cfg(not(any(windows, unix)))]
