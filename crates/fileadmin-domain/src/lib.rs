@@ -88,6 +88,61 @@ pub struct FileEntry {
     pub drive_info: Option<DriveInfo>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderSizeSummary {
+    pub request_id: u64,
+    pub pane: PaneId,
+    pub generation: u64,
+    pub path: PathBuf,
+    pub total_bytes: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub skipped_items: u64,
+    pub drive_total_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FolderSizeState {
+    Idle,
+    Loading {
+        request_id: u64,
+        pane: PaneId,
+        generation: u64,
+        path: PathBuf,
+    },
+    Ready(FolderSizeSummary),
+    Failed {
+        request_id: u64,
+        pane: PaneId,
+        generation: u64,
+        path: PathBuf,
+        message: String,
+    },
+}
+
+impl FolderSizeState {
+    pub fn matches(&self, pane: PaneId, generation: u64, path: &Path) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Loading {
+                pane: state_pane,
+                generation: state_generation,
+                path: state_path,
+                ..
+            }
+            | Self::Failed {
+                pane: state_pane,
+                generation: state_generation,
+                path: state_path,
+                ..
+            } => *state_pane == pane && *state_generation == generation && state_path == path,
+            Self::Ready(summary) => {
+                summary.pane == pane && summary.generation == generation && summary.path == path
+            }
+        }
+    }
+}
+
 impl FileEntry {
     pub fn is_directory(&self) -> bool {
         matches!(
@@ -328,6 +383,7 @@ pub struct AppState {
     pub should_quit: bool,
     pub operation: OperationView,
     pub text_prompt: Option<TextPrompt>,
+    pub folder_size: FolderSizeState,
 }
 
 impl AppState {
@@ -341,6 +397,7 @@ impl AppState {
             should_quit: false,
             operation: OperationView::Idle,
             text_prompt: None,
+            folder_size: FolderSizeState::Idle,
         }
     }
 
