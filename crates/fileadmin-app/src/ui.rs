@@ -173,9 +173,9 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
             EntryKind::File => " ",
             EntryKind::Other => "?",
         };
-        let name = truncate(&entry.display_name, name_width);
+        let name = pad_to_width(&truncate(&entry.display_name, name_width), name_width);
         let size = entry.size.map(human_size).unwrap_or_else(|| "—".into());
-        let line = format!("{cursor}{check} {kind}{name:<name_width$} {size:>8}");
+        let line = format!("{cursor}{check} {kind}{name} {size:>8}");
         let style = if focused {
             Style::default()
                 .fg(Color::Cyan)
@@ -244,6 +244,14 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
                 &pane.filter
             }
         )),
+        if pane.truncated {
+            Line::styled(
+                "Showing the first 50,000 entries",
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Line::raw(format!("Loaded: {} items", pane.entries.len()))
+        },
         Line::raw(""),
         Line::styled(
             "READ-ONLY · copy, move, rename, and delete are disabled",
@@ -357,13 +365,20 @@ fn safe_text(value: &str) -> String {
     value
         .chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_bidirectional_control(character) {
                 char::REPLACEMENT_CHARACTER
             } else {
                 character
             }
         })
         .collect()
+}
+
+fn is_bidirectional_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn truncate(value: &str, max_width: usize) -> String {
@@ -387,6 +402,14 @@ fn truncate(value: &str, max_width: usize) -> String {
         width += character_width;
     }
     output.push_str(suffix);
+    output
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    let current = UnicodeWidthStr::width(value);
+    let mut output = String::with_capacity(value.len() + width.saturating_sub(current));
+    output.push_str(value);
+    output.extend(std::iter::repeat_n(' ', width.saturating_sub(current)));
     output
 }
 
@@ -474,5 +497,11 @@ mod tests {
         assert_eq!(truncate("ab界cd", 5), "ab界…");
         assert_eq!(UnicodeWidthStr::width(truncate("ab界cd", 5).as_str()), 5);
         assert_eq!(truncate("hello", 0), "");
+        assert_eq!(UnicodeWidthStr::width(pad_to_width("界", 4).as_str()), 4);
+    }
+
+    #[test]
+    fn safe_text_replaces_bidirectional_controls() {
+        assert_eq!(safe_text("report\u{202e}fdp.exe"), "report�fdp.exe");
     }
 }

@@ -96,6 +96,7 @@ pub struct PaneState {
     pub sort: SortField,
     pub load_state: LoadState,
     pub generation: u64,
+    pub truncated: bool,
 }
 
 impl PaneState {
@@ -110,6 +111,7 @@ impl PaneState {
             sort: SortField::Name,
             load_state: LoadState::Loading,
             generation: 0,
+            truncated: false,
         }
     }
 
@@ -119,6 +121,7 @@ impl PaneState {
         self.cursor = 0;
         self.selected.clear();
         self.load_state = LoadState::Loading;
+        self.truncated = false;
         self.generation = self.generation.wrapping_add(1);
         self.generation
     }
@@ -132,6 +135,7 @@ impl PaneState {
         self.sort_entries();
         self.cursor = self.cursor.min(self.visible_len().saturating_sub(1));
         self.load_state = LoadState::Ready;
+        self.truncated = false;
         true
     }
 
@@ -142,6 +146,7 @@ impl PaneState {
         self.entries.clear();
         self.cursor = 0;
         self.load_state = LoadState::Failed(message);
+        self.truncated = false;
         true
     }
 

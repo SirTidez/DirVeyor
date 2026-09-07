@@ -71,8 +71,10 @@ fn drain_scan_events(app: &mut AppState, scanner: &DirectoryScanner) {
     while let Ok(event) = scanner.try_recv() {
         let pane = app.pane_mut(event.pane);
         match event.result {
-            Ok(entries) => {
-                pane.apply_entries(event.generation, entries);
+            Ok(listing) => {
+                if pane.apply_entries(event.generation, listing.entries) {
+                    pane.truncated = listing.truncated;
+                }
             }
             Err(error) => {
                 pane.apply_error(event.generation, error.message);

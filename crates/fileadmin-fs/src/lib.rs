@@ -11,6 +11,7 @@ use std::thread;
 const REQUEST_CAPACITY: usize = 8;
 const RESULT_CAPACITY: usize = 8;
 const WORKER_COUNT: usize = 2;
+pub const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 
 #[derive(Clone, Debug)]
 pub struct ScanRequest {
@@ -24,7 +25,13 @@ pub struct ScanEvent {
     pub pane: PaneId,
     pub generation: u64,
     pub path: PathBuf,
-    pub result: Result<Vec<FileEntry>, ScanError>,
+    pub result: Result<DirectoryListing, ScanError>,
+}
+
+#[derive(Debug)]
+pub struct DirectoryListing {
+    pub entries: Vec<FileEntry>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,21 +146,27 @@ fn worker_loop(requests: Arc<Mutex<Receiver<ScanRequest>>>, results: SyncSender<
     }
 }
 
-pub fn scan_directory(path: &Path) -> Result<Vec<FileEntry>, ScanError> {
+pub fn scan_directory(path: &Path) -> Result<DirectoryListing, ScanError> {
     let reader = fs::read_dir(path).map_err(ScanError::from_io)?;
     let mut entries = Vec::new();
+    let mut truncated = false;
     for item in reader {
+        if entries.len() == MAX_DIRECTORY_ENTRIES {
+            truncated = true;
+            break;
+        }
         let item = match item {
             Ok(item) => item,
             Err(_) => continue,
         };
         let path = item.path();
         let display_name = sanitize_display_name(&item.file_name().to_string_lossy());
+        let file_type = item.file_type();
+        let file_type_missing = file_type.is_err();
         let metadata = item.metadata();
-        let (kind, size, modified, metadata_incomplete) = match metadata {
-            Ok(metadata) => {
-                let file_type = metadata.file_type();
-                let kind = if file_type.is_dir() {
+        let kind = match file_type {
+            Ok(file_type) => {
+                if file_type.is_dir() {
                     EntryKind::Directory
                 } else if file_type.is_file() {
                     EntryKind::File
@@ -161,15 +174,17 @@ pub fn scan_directory(path: &Path) -> Result<Vec<FileEntry>, ScanError> {
                     EntryKind::Symlink
                 } else {
                     EntryKind::Other
-                };
-                (
-                    kind,
-                    file_type.is_file().then_some(metadata.len()),
-                    metadata.modified().ok(),
-                    false,
-                )
+                }
             }
-            Err(_) => (EntryKind::Other, None, None, true),
+            Err(_) => EntryKind::Other,
+        };
+        let (size, modified, metadata_incomplete) = match metadata {
+            Ok(metadata) => (
+                (kind == EntryKind::File).then_some(metadata.len()),
+                metadata.modified().ok(),
+                file_type_missing,
+            ),
+            Err(_) => (None, None, true),
         };
         entries.push(FileEntry {
             path,
@@ -180,13 +195,13 @@ pub fn scan_directory(path: &Path) -> Result<Vec<FileEntry>, ScanError> {
             metadata_incomplete,
         });
     }
-    Ok(entries)
+    Ok(DirectoryListing { entries, truncated })
 }
 
 pub fn sanitize_display_name(name: &str) -> String {
     name.chars()
         .flat_map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_bidirectional_control(character) {
                 char::REPLACEMENT_CHARACTER
             } else {
                 character
@@ -196,6 +211,13 @@ pub fn sanitize_display_name(name: &str) -> String {
             .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn is_bidirectional_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 #[cfg(test)]
@@ -209,9 +231,11 @@ mod tests {
         fs::write(temp.path().join("note.txt"), b"hello").unwrap();
         fs::create_dir(temp.path().join("folder")).unwrap();
 
-        let entries = scan_directory(temp.path()).unwrap();
+        let listing = scan_directory(temp.path()).unwrap();
+        let entries = listing.entries;
 
         assert_eq!(entries.len(), 2);
+        assert!(!listing.truncated);
         assert!(entries.iter().any(|entry| {
             entry.display_name == "note.txt"
                 && entry.kind == EntryKind::File
@@ -237,6 +261,9 @@ mod tests {
 
     #[test]
     fn display_names_cannot_inject_control_characters() {
-        assert_eq!(sanitize_display_name("hello\nworld\u{1b}"), "hello�world�");
+        assert_eq!(
+            sanitize_display_name("hello\nworld\u{1b}\u{202e}txt.exe"),
+            "hello�world��txt.exe"
+        );
     }
 }
