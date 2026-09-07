@@ -28,6 +28,13 @@ The foreground loop is the sole owner of terminal and application state.
 Workers never render and never mutate application state. The UI never performs
 filesystem work directly, and only one operation may be active at a time.
 
+The focused-folder size inspector has its own single background worker. It keeps
+only the newest request, checks cancellation throughout traversal, and keys each
+result by pane, pane generation, path, and request id. Rapid scrolling therefore
+replaces old work instead of building a queue, and stale results cannot attach to
+a different focused item. Folder analysis also yields whenever a reviewed file
+operation is active so it does not compete with planning or transfer I/O.
+
 ## Workspace crates
 
 ### `fileadmin-domain`
@@ -57,6 +64,8 @@ Read-only filesystem adapter:
 - a 50,000-entry in-memory cap with explicit truncation state.
 - Windows drive discovery plus native volume labels, filesystem types, and
   free/total capacity metrics.
+- cancellable recursive folder-size analysis that does not follow links,
+  junctions, or reparse points.
 
 The entry cap is a prototype safety bound, not the final large-directory
 strategy. Paging or a disk-backed index must replace it before million-entry
@@ -157,6 +166,10 @@ Windows hidden attributes are not yet considered.
   queue, pause/resume, undo, or recovery journal.
 - Capacity preflight is not yet connected to operation plans.
 - Links, junctions, reparse points, and special files are intentionally blocked.
+- Folder totals use logical file lengths rather than allocated clusters, so
+  sparse, compressed, and hard-linked data may differ from physical disk usage.
+- Drive-share percentage is available when the platform can report the volume's
+  total capacity; the current native implementation targets Windows.
 - Non-Windows moves use verified copy/remove; safe no-replace atomic directory
   rename is currently Windows-specific.
 - Automated checks exercise platform-neutral behavior on the local Windows

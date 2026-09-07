@@ -11,6 +11,12 @@ rename, or folder-creation jobs while directory work remains responsive. On
 Windows, the all-drives view reports volume labels, types, filesystems, capacity,
 used space, and available space.
 
+Focusing a directory starts a replaceable background traversal. The inspector
+shows its total contained file size, file/folder counts, and that total as a
+percentage of the containing drive's capacity. Moving focus cancels stale work;
+links and inaccessible items are skipped and identified when the result is
+partial.
+
 Every change is planned first and shown in a confirmation dialog. Existing
 destinations are never overwritten: copy and move conflicts receive numbered
 "Keep both" names, while rename and new-folder conflicts stop safely. Recycle
@@ -76,3 +82,5 @@ cargo clippy --workspace --all-targets -- -D warnings
   and link-aware operations are not implemented yet.
 - Automated checks cover planning, state, rendering, and read-only scanning.
   Live file-changing acceptance is intentionally left to an attended run.
+- Folder totals are logical file sizes. Sparse files, compression, and hard links
+  can make actual allocated disk usage differ from the displayed total.
