@@ -1,29 +1,32 @@
 # FileAdmin architecture
 
-Status: implemented foundation, milestone 1  
-Scope: read-only browser shell
+Status: implemented foundation and reviewed-operation milestone
+Scope: two-pane browser plus guarded filesystem changes
 
 ## Current boundary
 
-The first milestone intentionally performs no filesystem mutations. It proves
-terminal ownership, background directory reads, navigation, focus, selection,
-filtering, sorting, responsive rendering, and error presentation before copy,
-move, delete, or rename logic is introduced.
+The foreground loop owns terminal and application state. Directory discovery
+and filesystem operations run behind separate bounded channels so planning,
+copying, verification, and pane refreshes do not block rendering or input.
+Mutation is unreachable until the user approves an immutable plan summary.
 
 ```text
-keyboard events                          filesystem workers (2)
-      │                                          │
-      ▼                                          ▼
-fileadmin-app ── commands ──────────────► fileadmin-fs
-      │                                          │
-      │             bounded scan events ◄────────┘
+keyboard events                 scan workers (2)
+      │                                │
+      ▼                                ▼
+fileadmin-app ── scan requests ─► fileadmin-fs
+      │               scan events ◄────┘
+      │
+      ├── operation intent ─────► fileadmin-engine coordinator
+      │                           plan → review → approved execution
+      │               bounded progress/results ◄────┘
       ▼
-fileadmin-domain snapshot ──────────────► Ratatui renderer
+fileadmin-domain snapshot ─────► Ratatui renderer
 ```
 
 The foreground loop is the sole owner of terminal and application state.
 Workers never render and never mutate application state. The UI never performs
-filesystem work directly.
+filesystem work directly, and only one operation may be active at a time.
 
 ## Workspace crates
 
@@ -69,7 +72,24 @@ Executable and presentation layer:
 - command routing and navigation requests;
 - responsive Ratatui layouts;
 - Unicode display-width truncation and padding;
-- inspector, help overlay, notices, and read-only affordances.
+- inspector, help overlay, notices, and operation affordances;
+- name-entry, plan-review, progress/cancellation, and result overlays;
+- active-pane source and other-pane destination command routing;
+- automatic refresh of panes whose visible directory was affected.
+
+### `fileadmin-engine`
+
+Reviewed operation planner and executor:
+
+- a single bounded coordinator and at most two copy workers;
+- immutable plan summaries with exact item/file/byte counts, strategy, warnings,
+  and conflict resolutions;
+- root, overlap, self-descendant, link/reparse, special-file, and plan-size guards;
+- no-overwrite copy publication through temporary files;
+- Windows same-volume native no-replace moves;
+- cross-volume copy, SHA-256 verification, then frozen-source removal;
+- platform Recycle Bin / Trash integration with no permanent-delete fallback;
+- source revalidation after review and cancellation at safe boundaries.
 
 ## Scan lifecycle
 
@@ -96,10 +116,26 @@ Filtering is case-insensitive and applies to the loaded subset. Dot-prefixed
 files are concealed by default on every platform in this prototype. Native
 Windows hidden attributes are not yet considered.
 
+## Filesystem operation lifecycle
+
+1. The UI captures the active pane's selected items, or its focused item when
+   nothing is selected. Copy and move take the other open pane as destination.
+2. The coordinator enumerates a frozen manifest and returns a summary. No
+   mutation occurs during this phase.
+3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
+4. The executor revalidates source identity, performs the planned strategy, and
+   reports bounded progress. Cancellation stops before the next safe step.
+5. The UI displays a durable outcome and refreshes affected visible panes.
+
 ## Safety properties already enforced
 
-- No mutation code paths exist in the filesystem crate.
-- Future mutation keys return a visible read-only notice.
+- The directory-scanning crate remains read-only; mutations are isolated in the
+  operation engine.
+- No operation executes before explicit plan approval.
+- Existing destinations are not overwritten.
+- Failed Recycle Bin / Trash operations never fall back to permanent deletion.
+- Cross-volume move sources remain until copied files pass SHA-256 verification.
+- Sources are revalidated after review before mutation.
 - Directory work runs outside the rendering/input loop.
 - Queues and directory snapshots are bounded.
 - Stale results cannot replace current pane state.
@@ -117,16 +153,20 @@ Windows hidden attributes are not yet considered.
 - Symlinks are identified but cannot be followed from the UI.
 - Only dot-prefixed hidden files are recognized.
 - Inspector layout is hidden below 110 columns; a compact overlay is planned.
-- There is no persistent configuration, bookmarks, history, logging, queue, or
-  operation engine.
+- There is no persistent configuration, bookmarks, history, logging, durable
+  queue, pause/resume, undo, or recovery journal.
+- Capacity preflight is not yet connected to operation plans.
+- Links, junctions, reparse points, and special files are intentionally blocked.
+- Non-Windows moves use verified copy/remove; safe no-replace atomic directory
+  rename is currently Windows-specific.
 - Automated checks exercise platform-neutral behavior on the local Windows
-  toolchain; Linux, SSH, and real terminal compatibility remain separate gates.
+  toolchain without approving mutations; Linux, SSH, live filesystem changes,
+  and real-terminal interaction remain separate acceptance gates.
 
 ## Next architectural slice
 
-The next milestone should add a non-mutating operation planner rather than copy
-workers immediately. It should produce an inspectable manifest for a proposed
-copy or move, including source/destination relationships, estimated scope,
-conflicts, capacity uncertainty, link policy, verification policy, and recovery
-implications. Execution should remain disabled until plan validation and review
-states are tested.
+The next milestone should add destination-capacity preflight, richer per-item
+results, and an operation queue with pause/resume and persisted recovery state.
+Media-aware concurrency should distinguish rotational disks, solid-state media,
+network shares, and removable storage rather than using the current conservative
+two-worker ceiling.

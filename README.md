@@ -4,14 +4,18 @@ FileAdmin is a Rust terminal application for fast, understandable file
 management. It combines a keyboard-first two-pane browser with an explicit
 operation queue, device-aware transfer planning, and safety-focused previews.
 
-The first implemented milestone is a functional **read-only browser**. It can
-navigate two panes, select items, filter and sort entries, toggle dotfiles, and
-inspect metadata while directory work runs on bounded background workers. On
+The current milestone combines a functional two-pane browser with reviewed
+filesystem operations. It can navigate and select in either pane, filter and
+sort entries, toggle dotfiles, inspect metadata, and plan copy, move, recycle,
+rename, or folder-creation jobs while directory work remains responsive. On
 Windows, the all-drives view reports volume labels, types, filesystems, capacity,
 used space, and available space.
 
-Copy, move, rename, delete, external file opening, and the operation queue are
-deliberately disabled until the planning and review model is implemented.
+Every change is planned first and shown in a confirmation dialog. Existing
+destinations are never overwritten: copy and move conflicts receive numbered
+"Keep both" names, while rename and new-folder conflicts stop safely. Recycle
+uses the operating-system Recycle Bin or Trash and never falls back to permanent
+deletion.
 
 ## Run
 
@@ -33,8 +37,16 @@ Common controls:
 | `/` | Filter the active pane |
 | `h` | Toggle dotfiles |
 | `s` | Cycle sort field |
+| `c` | Review a copy from the active pane to the other pane |
+| `m` | Review a move from the active pane to the other pane |
+| `d` or `Delete` | Review moving the focused/selected items to Recycle Bin / Trash |
+| `r` or `F2` | Enter a new name, then review the rename |
+| `n` | Enter a name, then review creating a folder in the active pane |
+| `Enter` in review | Approve and execute the exact displayed plan |
+| `Esc` in review | Cancel without changing files |
+| `x`, `c`, or `Esc` while running | Request cancellation at the next safe point |
 | `F1` or `?` | Show help |
-| `q` or `Ctrl+C` | Quit |
+| `q` or `Ctrl+C` | Quit, or request cancellation when a job is active |
 
 ## Validate
 
@@ -50,9 +62,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 - [Interface concepts](docs/INTERFACE_CONCEPTS.md)
 - [Architecture](docs/ARCHITECTURE.md)
 
-## Current phase
+## Current phase and safety boundary
 
-1. Validate the read-only browser on Windows and Linux terminals.
-2. Add batched directory results and compact inspector behavior.
-3. Build a non-mutating copy/move planner and action-review flow.
-4. Introduce transfer execution only after the planner is well tested.
+- One operation runs at a time through a bounded background coordinator.
+- Copies use at most two workers and publish through temporary files without
+  replacing an existing destination.
+- Windows same-volume moves use a native no-replace rename. Other moves copy,
+  SHA-256 verify, and only then remove the frozen source tree.
+- Filesystem roots, overlapping selections, links, junctions, reparse points,
+  special files, and self-descendant transfers are rejected.
+- A plan is capped at 1,000 top-level selections and 100,000 discovered items.
+- Capacity preflight, pause/resume, persistent queues, undo, permanent delete,
+  and link-aware operations are not implemented yet.
+- Automated checks cover planning, state, rendering, and read-only scanning.
+  Live file-changing acceptance is intentionally left to an attended run.
