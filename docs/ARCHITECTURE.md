@@ -186,3 +186,12 @@ results, and an operation queue with pause/resume and persisted recovery state.
 Media-aware concurrency should distinguish rotational disks, solid-state media,
 network shares, and removable storage rather than using the current conservative
 two-worker ceiling.
+
+## Planned text preview boundary
+
+Text Preview is specified as a full-screen, read-only application mode with a
+dedicated replaceable reader request. Decoding, Markdown transformation, JSON
+formatting, and bounded literal/regex search must stay off the render loop.
+Neither preview contents nor search terms may enter diagnostic or operation
+logs. The complete interaction, resource-limit, and delivery plan is in
+[Text file preview design](PREVIEW_DESIGN.md).

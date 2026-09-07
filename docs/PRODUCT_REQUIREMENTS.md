@@ -53,6 +53,10 @@ network mounts, removable media, and very large directory trees.
 
 - Browse two locations without losing context.
 - Search, filter, sort, and inspect file metadata.
+- Preview Markdown, JSON, configuration, logs, plain text, and source code
+  without leaving the TUI.
+- Search previewed content with literal or bounded regular-expression matching,
+  highlighted results, and next/previous navigation.
 - Select one item, ranges, patterns, or many discontiguous items.
 - Copy, move, rename, create, delete, and restore where the platform permits.
 - Preview the exact scope and likely strategy of an operation.
@@ -84,6 +88,17 @@ network mounts, removable media, and very large directory trees.
 - Policy scope: this item, remaining items in this job, or remembered default.
 - Dry-run plan that performs no writes.
 
+### Preview text files
+
+- Full-screen, read-only preview that replaces Browse until explicitly exited.
+- Markdown Raw, Raw + Rendered side-by-side, and Rendered modes.
+- Strict JSON pretty display with raw fallback and visible parse locations.
+- Line-oriented configuration, log, plain-text, and source-code display.
+- Literal and regular-expression Find, case control, match highlighting, and
+  next/previous navigation.
+- Bounded large-file windows, text/binary detection, safe decoding, and visible
+  partial-content states.
+
 ### Queue and observe
 
 - Multiple independent jobs with bounded concurrency.
@@ -110,6 +125,10 @@ The top-level views are **Browse**, **Queue**, and **Log**. Browse is the defaul
 A stable top strip shows view, current job summary, and transient application
 state. A stable bottom strip shows commands relevant to the current focus.
 
+Text Preview is a full-screen subordinate view rather than a Browse region. It
+replaces the complete Browse layout until exited and restores Browse state
+without changing pane paths, focus, selections, filters, or sorting.
+
 Focus must always be visible. Selection and focus are different concepts: a row
 can be focused without being selected, and selected rows remain marked when
 focus moves elsewhere.
@@ -125,7 +144,7 @@ notification that never hides errors.
 | --- | --- | --- |
 | `Tab` / `Shift+Tab` | Change pane or region | Change region |
 | Arrows or `j`/`k` | Move focus | Move focus |
-| `Enter` | Open item or confirm | Expand job |
+| `Enter` | Open directory or preview supported file | Expand job |
 | `Space` | Toggle selection | Select job |
 | `Backspace` | Parent directory | Collapse details |
 | `/` | Filter current pane | Filter jobs |
@@ -133,7 +152,7 @@ notification that never hides errors.
 | `m` | Review move | Move/reprioritize job |
 | `d` | Review delete | Remove completed entry |
 | `r` | Rename | Retry failed subset |
-| `p` | Preview/dry run | Pause or resume |
+| `p` | Preview focused text file | Pause or resume |
 | `Esc` | Back/cancel overlay | Back/cancel overlay |
 | `?` or `F1` | Context help | Context help |
 
@@ -288,7 +307,9 @@ can be finalized.
    concurrency, pause/resume/retry.
 5. **Mutation breadth:** move, rename, create, trash/delete, platform adapters,
    and recovery manifests.
-6. **Hardening:** fault injection, large-tree tests, compatibility matrix,
+6. **Text preview:** bounded raw viewing, Markdown raw/split/rendered modes,
+   JSON formatting, large-file windows, and safe content handling.
+7. **Hardening:** fault injection, large-tree tests, compatibility matrix,
    benchmarks, packaging, and documentation.
 
 ## 16. Decisions still to make
@@ -299,7 +320,7 @@ can be finalized.
 - Whether session manifests survive restart in the first release.
 - Default verification and durability levels.
 - Scope and semantics of trash/recycle integration.
-- Mouse support and preview plug-ins.
+- Mouse support and preview plug-ins beyond the built-in text preview.
 - Remote protocols beyond mounted filesystems.
 - Whether elevated operations are delegated to a small platform helper or left
   to relaunch/manual workflows.
@@ -314,4 +335,3 @@ can be finalized.
 - Can they find the failure and retry only unfinished work?
 - At 80x24, are the essential path, selection, action, and progress facts still
   visible?
-

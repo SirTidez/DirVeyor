@@ -73,6 +73,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - [Product requirements](docs/PRODUCT_REQUIREMENTS.md)
 - [Interface concepts](docs/INTERFACE_CONCEPTS.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Text preview design](docs/PREVIEW_DESIGN.md)
 
 ## Current phase and safety boundary
 
