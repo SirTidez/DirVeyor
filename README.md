@@ -134,7 +134,9 @@ Shift is not required unless a binding explicitly says `Shift`.
 | `Ctrl+D` | Switch between Recycle Bin / Trash and permanent deletion |
 | `R` or `F2` | Enter a new name, then review the rename |
 | `N` | Enter a name, then review creating a folder in the active pane |
-| `Enter` in review | Approve the displayed plan; permanent deletion also requires typing `DELETE` |
+| `Enter` in review | Approve copy, move, Recycle Bin / Trash, rename, or new-folder plans |
+| `Y` in permanent-delete review | Yes, execute the reviewed permanent deletion |
+| `N` in permanent-delete review | No, abandon the deletion without changing files |
 | `Esc` in review | Cancel without changing files |
 | `X`, `C`, or `Esc` while running | Request cancellation at the next safe point |
 | `1`–`6` during a conflict | Keep newer, keep older, keep source, keep destination, keep both, or skip |
@@ -146,11 +148,11 @@ Shift is not required unless a binding explicitly says `Shift`.
 
 Recycle mode is the default. It uses the operating-system Recycle Bin or Trash
 and never silently falls back to permanent deletion. `Ctrl+D` switches to the
-clearly labeled permanent mode; permanent plans require the user to type
-`DELETE` before Enter can execute them. Permanent deletion cannot be undone,
-and a later error can occur after earlier reviewed entries have already been
-removed. While running, FileAdmin shows removed bytes, file count, folder count,
-overall entry count, current path, and a progress bar.
+clearly labeled permanent mode. Its review requires one explicit `Y` for yes;
+`N` or `Esc` abandons the plan without changing files. Permanent deletion cannot
+be undone, and a later error can occur after earlier reviewed entries have
+already been removed. While running, FileAdmin shows removed bytes, file count,
+folder count, overall entry count, current path, and a progress bar.
 
 Permanent deletion scans and freezes the complete readable tree before review,
 then removes reviewed files individually and folders from deepest to shallowest.

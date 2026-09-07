@@ -249,8 +249,9 @@ mode to tune the policy.
 - Make cancellation cooperative and document the last safe cancellation point.
 - Never silently overwrite a destination under the default policy.
 - Keep recycle and permanent deletion as distinct modes. Permanent deletion
-  requires a typed confirmation, shows exact reviewed file/folder/byte totals,
-  and reports entry-by-entry removal progress and any partial result.
+  requires an explicit `Y`/`N` confirmation, shows exact reviewed
+  file/folder/byte totals, and reports entry-by-entry removal progress and any
+  partial result.
 - Offer Windows elevation only after a permission-denied delete failure and
   only from a non-elevated process. A new elevated process must require a fresh
   plan and review rather than replaying the failed operation automatically.

@@ -99,14 +99,14 @@ Reviewed operation planner and executor:
 - immutable plan summaries with exact copy/move/permanent-delete counts or
   explicitly labeled top-level recycle scope, strategy, warnings, and conflict
   resolutions;
-- root, overlap, self-descendant, link/reparse, special-file, and plan-size guards;
+- root, overlap, self-descendant, link/reparse, special-file, and source-count guards;
 - streaming transfer discovery with temporary-file publication and interactive
   conflict resolution;
 - Windows same-volume native no-replace moves;
 - selectable Full SHA-256 or Fast verification, followed by journaled source
   cleanup for cross-volume moves;
 - platform Recycle Bin / Trash integration with no permanent-delete fallback;
-- opt-in permanent deletion with a typed `DELETE` confirmation;
+- opt-in permanent deletion with an explicit `Y`/`N` confirmation;
 - source revalidation after review and cancellation at safe boundaries.
 
 ## Scan lifecycle
@@ -146,7 +146,7 @@ Windows hidden attributes are not yet considered.
    selected-root scope so an inaccessible descendant cannot block the operating
    system's Recycle Bin / Trash facility.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
-   Permanent deletion additionally requires typing `DELETE`.
+   Permanent deletion instead requires `Y` for yes; `N` or `Esc` abandons it.
 4. The executor revalidates source identity, performs the planned strategy, and
    reports bounded progress. Transfer discovery feeds a bounded queue while one
    same-volume or two cross-volume workers copy independent files. A conflict
