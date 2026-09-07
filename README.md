@@ -1,6 +1,8 @@
-# FileAdmin
+# DirVeyor
 
-FileAdmin is a Rust terminal application for fast, understandable file
+> Directory + Surveyor: know what is moving and where it is going.
+
+DirVeyor is a Rust terminal application for fast, understandable file
 management. It combines a keyboard-first two-pane browser with an explicit
 operation queue, device-aware transfer planning, and safety-focused previews.
 
@@ -50,13 +52,13 @@ of treating a large directory as one item.
 
 ## User guide
 
-### Running FileAdmin
+### Running DirVeyor
 
-Normal use starts with the packaged `fileadmin.exe`; Rust and Cargo are not
+Normal use starts with the packaged `dirveyor.exe`; Rust and Cargo are not
 required. Open the executable directly or run it from a terminal:
 
 ```console
-.\fileadmin.exe
+.\dirveyor.exe
 ```
 
 Use a terminal at least 80×24 characters. Both browser panes initially show All
@@ -65,8 +67,9 @@ started.
 
 ### Interface tour
 
-These captures are rendered from FileAdmin's actual Ratatui interface at
-140×38 terminal cells.
+These captures are rendered from the application's actual Ratatui interface at
+140×38 terminal cells. They currently show the former FileAdmin working name;
+the layouts and controls are unchanged in DirVeyor.
 
 #### Drive-first browsing
 
@@ -74,7 +77,7 @@ The User folder and Favorites are kept separate from physical volumes. Focusing
 a drive exposes its type, filesystem, capacity, usage, available space, and a
 graphical usage bar.
 
-![Two FileAdmin panes showing user-folder shortcuts, Favorites, drive usage, and the drive inspector](docs/images/all-drives.png)
+![Two DirVeyor panes showing user-folder shortcuts, Favorites, drive usage, and the drive inspector](docs/images/all-drives.png)
 
 #### Favorites
 
@@ -82,7 +85,7 @@ graphical usage bar.
 Saved folders can be opened in the active pane or removed directly from this
 panel.
 
-![FileAdmin Favorites panel listing two saved folders](docs/images/favorites.png)
+![DirVeyor Favorites panel listing two saved folders](docs/images/favorites.png)
 
 #### Folder inspection
 
@@ -90,7 +93,7 @@ Focusing a directory starts background analysis without blocking navigation.
 The inspector reports contained size, drive share, and discovered file and
 folder counts.
 
-![FileAdmin browsing two folders while the inspector displays a focused directory's contained size and drive share](docs/images/folder-inspector.png)
+![DirVeyor browsing two folders while the inspector displays a focused directory's contained size and drive share](docs/images/folder-inspector.png)
 
 #### Full-screen text preview
 
@@ -98,14 +101,14 @@ Preview temporarily replaces the browser. This Markdown example shows raw text
 and its rendered representation side by side; other modes include JSON Pretty,
 logs, configuration files, source code, and plain text.
 
-![FileAdmin full-screen Markdown preview showing raw and rendered content side by side](docs/images/markdown-preview.png)
+![DirVeyor full-screen Markdown preview showing raw and rendered content side by side](docs/images/markdown-preview.png)
 
 #### Reviewed filesystem operations
 
-Filesystem actions do not run immediately. FileAdmin first presents the plan,
+Filesystem actions do not run immediately. DirVeyor first presents the plan,
 destination, strategy, item totals, and warnings for explicit approval.
 
-![FileAdmin copy review showing source, destination, totals, safety warnings, and execution controls](docs/images/operation-review.png)
+![DirVeyor copy review showing source, destination, totals, safety warnings, and execution controls](docs/images/operation-review.png)
 
 ### Controls
 
@@ -151,7 +154,7 @@ and never silently falls back to permanent deletion. `Ctrl+D` switches to the
 clearly labeled permanent mode. Its review requires one explicit `Y` for yes;
 `N` or `Esc` abandons the plan without changing files. Permanent deletion cannot
 be undone, and a later error can occur after earlier reviewed entries have
-already been removed. While running, FileAdmin shows removed bytes, file count,
+already been removed. While running, DirVeyor shows removed bytes, file count,
 folder count, overall entry count, current path, and a progress bar.
 
 Permanent deletion scans and freezes the complete readable tree before review,
@@ -162,10 +165,10 @@ operating-system handoff and keeps top-level scope when a platform directory
 cannot be inspected recursively. Root paths, links, junctions, reparse points,
 special objects, and overlapping selections remain blocked.
 
-If Windows returns Access Denied during a delete attempt and FileAdmin is not
+If Windows returns Access Denied during a delete attempt and DirVeyor is not
 already elevated, the result offers `Ctrl+E`. This requests UAC and opens a new
-elevated FileAdmin at the same pane locations; the operation must be planned and
-approved again. FileAdmin cannot elevate an already-running process in place.
+elevated DirVeyor at the same pane locations; the operation must be planned and
+approved again. DirVeyor cannot elevate an already-running process in place.
 Elevation is not offered for unrelated failures or when the process is already
 elevated. An elevated Access Denied result usually requires inspection of the
 path's ownership, access-control entries, or filesystem health.
@@ -179,7 +182,7 @@ next/previous match, and `Esc` or `Q` to return to Browse. Markdown uses `1` Raw
 `[` and `]` load adjacent byte windows, while `G` and `Shift+G` load the first or
 last window. `F1` shows the complete preview-specific key guide.
 
-Favorites persist in FileAdmin's per-user configuration directory and can be
+Favorites persist in DirVeyor's per-user configuration directory and can be
 opened or removed from the `Ctrl+F` panel.
 
 ### Large transfers and conflicts
@@ -195,7 +198,7 @@ entries, bytes, and the current path. Once approved, the transfer starts with th
 reviewed totals and a determinate progress bar while execution traverses the tree
 again through its bounded queue.
 
-For file/file conflicts, FileAdmin displays both full paths, sizes, readable
+For file/file conflicts, DirVeyor displays both full paths, sizes, readable
 modified times, and explicitly identifies the newer side. The choices are Keep
 newer, Keep older, Keep source, Keep destination, Keep both, and Skip. Equal
 timestamp and equal-size files are hashed; identical files need no prompt, while
@@ -203,7 +206,7 @@ different files remain unresolved. Apply-to-all is scoped to the current job and
 stored separately for file/file and type conflicts.
 
 The conflict vocabulary is informed by FileZilla's documented file-exists
-actions, including ask, conditional overwrite, rename, resume, and skip. FileAdmin
+actions, including ask, conditional overwrite, rename, resume, and skip. DirVeyor
 adapts these to local two-pane semantics rather than copying FTP-specific behavior:
 [FileZilla Pro file-exists actions](https://filezillapro.com/docs/v3/advanced/change-default-file-exists-behaviour/).
 
@@ -222,7 +225,7 @@ same release artifact used by normal users:
 
 ```console
 cargo build --release
-.\target\release\fileadmin.exe
+.\target\release\dirveyor.exe
 ```
 
 `cargo run` is a developer convenience for testing source changes; it is not the

@@ -1,11 +1,11 @@
-# FileAdmin product requirements
+# DirVeyor product requirements
 
 Status: concept draft 0.1  
-Working name: FileAdmin
+Product name: DirVeyor
 
 ## 1. Product intent
 
-FileAdmin is a keyboard-first terminal file manager that makes file operations
+DirVeyor is a keyboard-first terminal file manager that makes file operations
 easy to understand before and during execution. It should feel as immediate as
 a traditional two-pane manager while exposing enough context to prevent
 surprises: selected items, destination capacity, conflicts, operation strategy,
@@ -264,15 +264,15 @@ mode to tune the policy.
 
 Suggested Rust workspace crates/modules:
 
-- `fileadmin-app`: startup, configuration, terminal ownership, shutdown.
-- `fileadmin-ui`: Ratatui rendering, focus model, responsive layouts, themes.
-- `fileadmin-domain`: commands, selections, plans, jobs, conflicts, events.
-- `fileadmin-fs`: platform-neutral filesystem operations and capability model.
-- `fileadmin-platform`: Windows/Linux-specific volume, trash, metadata, and
+- `dirveyor-app`: startup, configuration, terminal ownership, shutdown.
+- `dirveyor-ui`: Ratatui rendering, focus model, responsive layouts, themes.
+- `dirveyor-domain`: commands, selections, plans, jobs, conflicts, events.
+- `dirveyor-fs`: platform-neutral filesystem operations and capability model.
+- `dirveyor-platform`: Windows/Linux-specific volume, trash, metadata, and
   atomic-operation adapters.
-- `fileadmin-engine`: planner, resource scheduler, workers, cancellation, retry.
-- `fileadmin-store`: bookmarks, preferences, session manifests, audit history.
-- `fileadmin-testkit`: deterministic fake filesystem, fault injection, and
+- `dirveyor-engine`: planner, resource scheduler, workers, cancellation, retry.
+- `dirveyor-store`: bookmarks, preferences, session manifests, audit history.
+- `dirveyor-testkit`: deterministic fake filesystem, fault injection, and
   scheduler simulation.
 
 Recommended implementation direction: Tokio for asynchronous coordination,

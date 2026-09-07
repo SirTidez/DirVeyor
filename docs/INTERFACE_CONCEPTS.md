@@ -1,4 +1,4 @@
-# FileAdmin interface concepts
+# DirVeyor interface concepts
 
 The initial visual set explores one cohesive interface rather than unrelated
 skins. Each image corresponds to a critical product state.
@@ -13,7 +13,7 @@ paths, labels, and generated application names in the images are illustrative.
 Purpose: make navigation, focus, selection, destination context, and available
 actions legible at a glance.
 
-![Browse workspace concept](../output/imagegen/fileadmin-browse-concept.png)
+![Browse workspace concept](../output/imagegen/dirveyor-browse-concept.png)
 
 ```text
 ┌ Browse ───────────────── Queue: 2 active ─────────────── ? Help ┐
@@ -40,7 +40,7 @@ remain distinguishable without color.
 Purpose: explain concurrent work without pretending every job progresses in the
 same way.
 
-![Activity queue concept](../output/imagegen/fileadmin-queue-concept.png)
+![Activity queue concept](../output/imagegen/dirveyor-queue-concept.png)
 
 ```text
 ┌ Queue ───────────── 3 running · 1 needs input ───── Overall 61% ┐
@@ -67,7 +67,7 @@ percentage.
 
 Purpose: turn a risky confirmation into an understandable decision.
 
-![Action review concept](../output/imagegen/fileadmin-review-concept.png)
+![Action review concept](../output/imagegen/dirveyor-review-concept.png)
 
 ```text
 │                 ┌ Review move ───────────────────────────────┐

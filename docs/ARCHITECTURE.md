@@ -1,4 +1,4 @@
-# FileAdmin architecture
+# DirVeyor architecture
 
 Status: implemented foundation and reviewed-operation milestone
 Scope: two-pane browser plus guarded filesystem changes
@@ -14,14 +14,14 @@ Mutation is unreachable until the user approves an immutable plan summary.
 keyboard events                 scan workers (2)
       │                                │
       ▼                                ▼
-fileadmin-app ── scan requests ─► fileadmin-fs
+dirveyor-app ── scan requests ─► dirveyor-fs
       │               scan events ◄────┘
       │
-      ├── operation intent ─────► fileadmin-engine coordinator
+      ├── operation intent ─────► dirveyor-engine coordinator
       │                           plan → review → approved execution
       │               bounded progress/results ◄────┘
       ▼
-fileadmin-domain snapshot ─────► Ratatui renderer
+dirveyor-domain snapshot ─────► Ratatui renderer
 ```
 
 The foreground loop is the sole owner of terminal and application state.
@@ -40,7 +40,7 @@ avoid redundant Windows path lookups.
 
 ## Workspace crates
 
-### `fileadmin-domain`
+### `dirveyor-domain`
 
 Pure application data with no terminal or filesystem dependencies:
 
@@ -55,7 +55,7 @@ Pure application data with no terminal or filesystem dependencies:
 
 This crate is the seam for state-machine and property tests.
 
-### `fileadmin-fs`
+### `dirveyor-fs`
 
 Read-only filesystem adapter:
 
@@ -76,7 +76,7 @@ The entry cap is a prototype safety bound, not the final large-directory
 strategy. Paging or a disk-backed index must replace it before million-entry
 support can be claimed.
 
-### `fileadmin-app`
+### `dirveyor-app`
 
 Executable and presentation layer:
 
@@ -91,7 +91,7 @@ Executable and presentation layer:
 - active-pane source and other-pane destination command routing;
 - automatic refresh of panes whose visible directory was affected.
 
-### `fileadmin-engine`
+### `dirveyor-engine`
 
 Reviewed operation planner and executor:
 
@@ -187,7 +187,7 @@ Windows hidden attributes are not yet considered.
 
 On Windows, a permission-denied delete result offers elevation only when the
 current process is not already elevated. `Ctrl+E` invokes the operating-system
-`runas` flow and starts a new FileAdmin process at the current pane locations;
+`runas` flow and starts a new DirVeyor process at the current pane locations;
 it never executes the failed operation automatically. The user must plan and
 approve the operation again in the elevated process. If an elevated process is
 still denied, the UI points to ownership, access-control, or filesystem-health
@@ -201,7 +201,7 @@ preserving the drive metadata returned by the scanner. The dedicated Favorites
 panel reads the same ordered list and opens its chosen folder in the active
 browser pane.
 
-Favorites persist as a bounded list of paths in FileAdmin's per-user
+Favorites persist as a bounded list of paths in DirVeyor's per-user
 configuration directory. Saving creates the parent directory when needed and
 publishes a complete replacement file, preventing a partially written JSON
 document from becoming the next startup state. Duplicate paths are removed
@@ -245,8 +245,8 @@ Text Preview is implemented as a full-screen, read-only application mode with
 a dedicated replaceable reader request. The background reader owns bounded file
 I/O, classification, decoding, Markdown transformation, and JSON formatting.
 Reusable document, presentation, and search state remains in
-`fileadmin-domain`; Ratatui rendering and input routing remain in
-`fileadmin-app`. Neither preview contents nor search terms enter diagnostic or
+`dirveyor-domain`; Ratatui rendering and input routing remain in
+`dirveyor-app`. Neither preview contents nor search terms enter diagnostic or
 operation logs.
 
 The current search pass runs against the bounded in-memory representation when

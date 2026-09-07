@@ -4,7 +4,7 @@ Status: slices 1–3 implemented; preview polish and measured optimization pendi
 
 ## 1. Goal
 
-FileAdmin should preview human-readable files without leaving the terminal or
+DirVeyor should preview human-readable files without leaving the terminal or
 executing their contents. Preview is a read-only application view, not an
 external opener and not part of the filesystem operation engine.
 
@@ -92,8 +92,8 @@ to raw lines. The active half has the stronger border.
 │ 40 ## Installation            │ INSTALLATION                 │
 │ 41                            │                              │
 │ 42 Run:                       │ Run:                         │
-│ 43 ```console                 │   cargo install fileadmin    │
-│ 44 cargo install fileadmin    │                              │
+│ 43 ```console                 │   cargo install dirveyor    │
+│ 44 cargo install dirveyor    │                              │
 │ 45 ```                        │ Requirements                 │
 ├───────────────────────────────┴──────────────────────────────┤
 │ Esc Back  1 Raw  2 Split  3 Rendered  Tab Focus  / Find     │
@@ -197,7 +197,7 @@ PreviewDocument
   mode, active region, scroll offsets, wrap, and search state
 ```
 
-`fileadmin-fs` owns a dedicated read-only preview service with a replaceable
+`dirveyor-fs` owns a dedicated read-only preview service with a replaceable
 request slot and bounded result channel. It reads bytes, classifies content,
 decodes text, and reports source identity. Markdown and JSON transformation also
 run on this reader thread. It performs no terminal rendering and never writes
@@ -207,8 +207,8 @@ A focused transformation module converts decoded snapshots into presentation
 blocks. Markdown parsing and JSON parsing happen off the UI thread. Candidate
 libraries are `pulldown-cmark` for CommonMark/GFM events and `serde_json` for
 strict JSON; versions and feature sets must be reviewed when implementation
-begins. Ratatui conversion remains in `fileadmin-app`, while reusable preview
-state belongs in `fileadmin-domain`.
+begins. Ratatui conversion remains in `dirveyor-app`, while reusable preview
+state belongs in `dirveyor-domain`.
 
 Preview search state stores the query, Literal/Regex mode, case mode, bounded
 match spans, active match, and whether results cover the complete file. The
@@ -234,7 +234,7 @@ move the user's scroll position.
 - The original bytes remain unchanged; JSON formatting and Markdown rendering
   only produce in-memory representations.
 - Previewing `.env`, keys, configuration, or logs is local and explicit. Their
-  contents are never persisted in FileAdmin diagnostics.
+  contents are never persisted in DirVeyor diagnostics.
 
 ## 7. Responsive layout
 
