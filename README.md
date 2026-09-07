@@ -33,12 +33,15 @@ the visible window first. Preview also detects source size or modified-time
 changes and offers an explicit reload instead of silently replacing the view.
 
 Every change is planned first and shown in a confirmation dialog. Copy and move
-stream directory trees through a bounded work queue without a fixed
-discovered-item limit. Cross-volume transfers can copy up to two independent
-files at once; same-volume transfers use one file worker to avoid competing seeks.
-Existing folders merge; colliding files pause discovery for a six-choice
-conflict decision while already queued work continues. File conflicts and
-file/folder type conflicts have separate per-job Apply-to-all policies. Recycle
+first perform a metadata-only count of files, folders, and logical bytes without
+retaining a file manifest or imposing the permanent-delete manifest limit. The
+review therefore shows exact transfer scope, and execution starts with a real
+progress-bar denominator. Execution traverses the tree again and feeds a bounded
+work queue. Cross-volume transfers can copy up to two independent files at once;
+same-volume transfers use one file worker to avoid competing seeks. Existing
+folders merge; colliding files pause discovery for a six-choice conflict decision
+while already queued work continues. File conflicts and file/folder type
+conflicts have separate per-job Apply-to-all policies. Recycle
 uses the operating-system Recycle Bin or Trash and never falls back to permanent
 deletion. Permanent deletion is a separate mode with an additional typed
 confirmation. Its planning screen scans the full tree without changing it, and
@@ -241,10 +244,12 @@ cargo build --release --workspace
 ### Current phase and safety boundary
 
 - One operation runs at a time through a bounded background coordinator.
-- Transfers stream directory entries into a bounded queue feeding one
-  same-volume or up to two cross-volume file workers. Each worker publishes
-  through a temporary file. Explicit Keep source/newer/older decisions may
-  atomically replace a revalidated destination file.
+- Transfer planning performs a count-only metadata pass so review and execution
+  have exact item and byte totals without retaining a manifest. Execution then
+  streams directory entries into a bounded queue feeding one same-volume or up
+  to two cross-volume file workers. Each worker publishes through a temporary
+  file. Explicit Keep source/newer/older decisions may atomically replace a
+  revalidated destination file.
 - Windows same-volume moves with a clear destination use a native no-replace
   rename. Other moves stream-copy, verify using the selected mode, journal
   verified sources on disk, and only then remove those sources.

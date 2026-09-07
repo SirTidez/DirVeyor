@@ -138,9 +138,11 @@ Windows hidden attributes are not yet considered.
 
 1. A pane with selections remains the marked transfer source when focus moves to
    the destination. If both panes have selections, the active pane is the source.
-2. Copy and move validate roots and destination, then stream traversal during
-   execution without an in-memory item manifest. Permanent delete freezes an
-   exact manifest during planning. Recycle keeps
+2. Copy and move validate roots and destination, then run a metadata-only count
+   pass. The resulting exact files, folders, and bytes are reviewed without
+   retaining an in-memory item manifest. Execution traverses the tree again and
+   streams work through its bounded queue. Permanent delete freezes an exact
+   manifest during planning. Recycle keeps
    selected-root scope so an inaccessible descendant cannot block the operating
    system's Recycle Bin / Trash facility.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.

@@ -224,9 +224,11 @@ The scheduler should model resources, not merely spawn one task per file.
 
 Current baseline implementation uses one file worker when all sources and the
 destination share a volume, and up to two workers for cross-volume transfers.
-The discovery producer is separate and feeds only eight queued files per worker.
-This is deliberately conservative until reliable medium detection and measured
-adaptive scheduling are implemented.
+Planning first performs an uncapped count-only metadata traversal so the review
+and progress bar have exact file, folder, and byte totals without a retained file
+manifest. During execution, the discovery producer traverses again and feeds only
+eight queued files per worker. This is deliberately conservative until reliable
+medium detection and measured adaptive scheduling are implemented.
 
 No device class guarantees an optimal fixed worker count. The implementation
 must benchmark representative workloads and expose enough telemetry in debug
