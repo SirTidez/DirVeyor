@@ -280,6 +280,7 @@ dependencies = [
  "tempfile",
  "time",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

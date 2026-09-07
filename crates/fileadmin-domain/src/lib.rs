@@ -476,11 +476,36 @@ pub struct AppState {
     pub home_directory: Option<PathBuf>,
     pub favorites: Vec<PathBuf>,
     pub favorites_panel: Option<FavoritesPanel>,
+    pub delete_mode: DeleteMode,
+    pub delete_confirmation: String,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct FavoritesPanel {
     pub cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeleteMode {
+    #[default]
+    Recycle,
+    Permanent,
+}
+
+impl DeleteMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Recycle => "Recycle Bin / Trash",
+            Self::Permanent => "Permanent delete",
+        }
+    }
+
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::Recycle => Self::Permanent,
+            Self::Permanent => Self::Recycle,
+        }
+    }
 }
 
 impl AppState {
@@ -501,6 +526,8 @@ impl AppState {
             home_directory: None,
             favorites: Vec::new(),
             favorites_panel: None,
+            delete_mode: DeleteMode::Recycle,
+            delete_confirmation: String::new(),
         }
     }
 

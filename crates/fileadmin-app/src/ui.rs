@@ -82,7 +82,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     } else if let Some(prompt) = &app.text_prompt {
         render_text_prompt(frame, area, prompt);
     } else if !matches!(app.operation, OperationView::Idle) {
-        render_operation(frame, area, &app.operation);
+        render_operation(frame, area, app);
     }
 }
 
@@ -785,6 +785,10 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
     } else {
         lines.push(Line::raw("No item focused"));
     }
+    let delete_action = match app.delete_mode {
+        fileadmin_domain::DeleteMode::Recycle => "D Recycle · Ctrl+D Change mode",
+        fileadmin_domain::DeleteMode::Permanent => "D DELETE · Ctrl+D Change mode",
+    };
     lines.extend([
         Line::raw(""),
         Line::styled("Pane", Style::default().fg(Color::DarkGray)),
@@ -815,10 +819,8 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             "P Preview · C Copy · M Move",
             Style::default().fg(Color::Cyan),
         ),
-        Line::styled(
-            "D Recycle · R Rename · N Folder",
-            Style::default().fg(Color::Cyan),
-        ),
+        Line::styled(delete_action, Style::default().fg(Color::Cyan)),
+        Line::styled("R Rename · N Folder", Style::default().fg(Color::Cyan)),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -995,7 +997,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             app.active().filter
         )
     } else if area.width >= 110 {
-        " Tab Pane  ↑↓ Move  ← Back  → Open/Select  Enter Open/Preview  C Copy  M Move  D Recycle  F1 Help".into()
+        format!(
+            " Tab Pane  ↑↓ Move  ← Back  → Open/Select  Enter Open/Preview  C Copy  M Move  D {}  Ctrl+D Mode  F1 Help",
+            match app.delete_mode {
+                fileadmin_domain::DeleteMode::Recycle => "Recycle",
+                fileadmin_domain::DeleteMode::Permanent => "DELETE",
+            }
+        )
     } else {
         " ↑↓ Move  ← Back  → Open/Select  Enter Open  P Preview  F1 Help".into()
     };
@@ -1026,7 +1034,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw("/                  Filter active pane"),
         Line::raw("H / S              Toggle dotfiles / cycle sort"),
         Line::raw("C / M              Plan copy / move to other pane"),
-        Line::raw("D / Delete         Plan move to Recycle Bin / Trash"),
+        Line::raw("D / Delete         Plan using the current delete mode"),
+        Line::raw("Ctrl+D             Toggle Recycle / permanent delete"),
         Line::raw("R / F2 / N         Rename item / create folder"),
         Line::raw("F / Ctrl+F         Add favorite / open Favorites"),
         Line::raw("Q / Ctrl+C         Quit"),
@@ -1175,11 +1184,13 @@ fn render_text_prompt(frame: &mut Frame, area: Rect, prompt: &TextPrompt) {
     );
 }
 
-fn render_operation(frame: &mut Frame, area: Rect, operation: &OperationView) {
-    match operation {
+fn render_operation(frame: &mut Frame, area: Rect, app: &AppState) {
+    match &app.operation {
         OperationView::Idle => {}
         OperationView::Planning { kind, .. } => render_planning(frame, area, *kind),
-        OperationView::Review(summary) => render_review(frame, area, summary),
+        OperationView::Review(summary) => {
+            render_review(frame, area, summary, &app.delete_confirmation)
+        }
         OperationView::Running(progress) => render_running(frame, area, progress),
         OperationView::Finished(report) => render_finished(frame, area, report),
         OperationView::Error { kind, message, .. } => {
@@ -1215,16 +1226,23 @@ fn render_planning(frame: &mut Frame, area: Rect, kind: OperationKind) {
     );
 }
 
-fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary) {
+fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_confirmation: &str) {
     let popup = centered_rect(84, 82, area);
     let mut lines = vec![
         Line::styled(
-            format!(
-                "{} items · {} files · {}",
-                summary.item_count,
-                summary.file_count,
-                human_size(summary.total_bytes)
-            ),
+            if summary.recursive_scope_known {
+                format!(
+                    "{} items · {} files · {}",
+                    summary.item_count,
+                    summary.file_count,
+                    human_size(summary.total_bytes)
+                )
+            } else {
+                format!(
+                    "{} selected roots · directory contents not pre-enumerated",
+                    summary.item_count
+                )
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1277,10 +1295,24 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary) {
         ));
     }
     lines.push(Line::raw(""));
+    if summary.kind == OperationKind::PermanentDelete {
+        lines.push(Line::styled(
+            "Type DELETE to confirm irreversible removal:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            format!("Confirmation: {delete_confirmation}_"),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
     lines.push(Line::styled(
         review_confirmation(summary.kind),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(if summary.kind == OperationKind::PermanentDelete {
+                Color::Red
+            } else {
+                Color::Cyan
+            })
             .add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::styled(
@@ -1292,18 +1324,22 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary) {
         popup,
         &format!(" Review {} ", summary.kind.label()),
         lines,
-        if summary.kind == OperationKind::Recycle {
-            Color::Yellow
-        } else {
-            Color::Cyan
+        match summary.kind {
+            OperationKind::Recycle => Color::Yellow,
+            OperationKind::PermanentDelete => Color::Red,
+            _ => Color::Cyan,
         },
     );
 }
 
 fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::OperationProgress) {
     let popup = centered_rect(78, 42, area);
-    let percent = progress_percent(progress.completed_bytes, progress.total_bytes)
-        .or_else(|| progress_percent(progress.completed_items, progress.total_items));
+    let percent = if progress.kind.is_delete() {
+        progress_percent(progress.completed_items, progress.total_items)
+    } else {
+        progress_percent(progress.completed_bytes, progress.total_bytes)
+            .or_else(|| progress_percent(progress.completed_items, progress.total_items))
+    };
     let mut lines = vec![
         Line::styled(
             format!(
@@ -1321,12 +1357,14 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
             "Items: {} / {}",
             progress.completed_items, progress.total_items
         )),
-        Line::raw(format!(
+    ];
+    if !progress.kind.is_delete() {
+        lines.push(Line::raw(format!(
             "Transferred: {} / {}",
             human_size(progress.completed_bytes),
             human_size(progress.total_bytes)
-        )),
-    ];
+        )));
+    }
     if let Some(path) = &progress.current_path {
         lines.push(Line::raw(format!(
             "Current: {}",
@@ -1358,12 +1396,19 @@ fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::Ope
             format!("{} {}", outcome_label(report.outcome), report.kind.label()),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Line::raw(format!(
-            "{} of {} items · {} transferred",
-            report.completed_items,
-            report.total_items,
-            human_size(report.completed_bytes)
-        )),
+        Line::raw(if report.kind.is_delete() {
+            format!(
+                "{} of {} selected items completed",
+                report.completed_items, report.total_items
+            )
+        } else {
+            format!(
+                "{} of {} items · {} transferred",
+                report.completed_items,
+                report.total_items,
+                human_size(report.completed_bytes)
+            )
+        }),
     ];
     if report.failures.is_empty() {
         lines.push(Line::raw("Affected panes have been refreshed."));
@@ -1384,6 +1429,31 @@ fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::Ope
                 Style::default().fg(Color::Red),
             ));
         }
+        if report.kind.is_delete()
+            && report
+                .failures
+                .iter()
+                .any(|failure| super::elevation_available(&failure.message))
+        {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Ctrl+E Open elevated FileAdmin for a new reviewed attempt",
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if cfg!(windows)
+            && report.kind.is_delete()
+            && super::is_process_elevated()
+            && report
+                .failures
+                .iter()
+                .any(|failure| super::is_permission_denied_message(&failure.message))
+        {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Already elevated: inspect the path's ownership, ACLs, or filesystem health",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
@@ -1395,7 +1465,7 @@ fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::Ope
 
 fn render_operation_error(frame: &mut Frame, area: Rect, kind: OperationKind, message: &str) {
     let popup = centered_rect(76, 42, area);
-    let lines = vec![
+    let mut lines = vec![
         Line::styled(
             format!("Could not plan {}", kind.label()),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1407,6 +1477,21 @@ fn render_operation_error(frame: &mut Frame, area: Rect, kind: OperationKind, me
         Line::raw(""),
         Line::styled("Enter / Esc  Return", Style::default().fg(Color::Cyan)),
     ];
+    if kind.is_delete() && super::elevation_available(message) {
+        lines.push(Line::styled(
+            "Ctrl+E Open elevated FileAdmin for a new reviewed attempt",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if cfg!(windows)
+        && kind.is_delete()
+        && super::is_permission_denied_message(message)
+        && super::is_process_elevated()
+    {
+        lines.push(Line::styled(
+            "Already elevated: inspect the path's ownership, ACLs, or filesystem health",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     render_modal(frame, popup, " Operation blocked ", lines, Color::Red);
 }
 
@@ -1435,6 +1520,7 @@ fn review_confirmation(kind: OperationKind) -> &'static str {
         OperationKind::Copy => "Enter Execute copy",
         OperationKind::Move => "Enter Execute move",
         OperationKind::Recycle => "Enter Move to Recycle Bin / Trash",
+        OperationKind::PermanentDelete => "Enter Permanently delete",
         OperationKind::Rename => "Enter Execute rename",
         OperationKind::CreateDirectory => "Enter Create folder",
     }
@@ -1806,6 +1892,7 @@ mod tests {
             item_count: 1,
             file_count: 1,
             total_bytes: 1_024,
+            recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: vec!["Sources remain until verification succeeds".into()],
         });
@@ -1815,6 +1902,36 @@ mod tests {
         assert!(screen.contains("Destination: right"));
         assert!(screen.contains("Enter Execute move"));
         assert!(screen.contains("Esc Back — no files will change"));
+    }
+
+    #[test]
+    fn permanent_delete_mode_and_phrase_are_unmistakable() {
+        let mut app = populated_app();
+        app.delete_mode = fileadmin_domain::DeleteMode::Permanent;
+        let browse = rendered_screen(&app, 160, 35);
+        assert!(browse.contains("D DELETE"));
+        assert!(browse.contains("Ctrl+D Mode"));
+
+        app.delete_confirmation = "DEL".into();
+        app.operation = OperationView::Review(PlanSummary {
+            job: JobId(17),
+            kind: OperationKind::PermanentDelete,
+            sources: vec![PathBuf::from("left").join("example.txt")],
+            destination: None,
+            strategy: PlannedStrategy::PermanentDelete,
+            item_count: 1,
+            file_count: 1,
+            total_bytes: 1_024,
+            recursive_scope_known: true,
+            conflicts: Vec::new(),
+            warnings: vec!["This operation cannot be undone".into()],
+        });
+
+        let review = rendered_screen(&app, 160, 35);
+        assert!(review.contains("Review permanent delete"));
+        assert!(review.contains("Type DELETE to confirm irreversible removal"));
+        assert!(review.contains("Confirmation: DEL_"));
+        assert!(review.contains("Enter Permanently delete"));
     }
 
     #[test]

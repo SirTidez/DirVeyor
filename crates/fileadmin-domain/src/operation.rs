@@ -9,6 +9,7 @@ pub enum OperationKind {
     Copy,
     Move,
     Recycle,
+    PermanentDelete,
     Rename,
     CreateDirectory,
 }
@@ -19,9 +20,14 @@ impl OperationKind {
             Self::Copy => "copy",
             Self::Move => "move",
             Self::Recycle => "recycle",
+            Self::PermanentDelete => "permanent delete",
             Self::Rename => "rename",
             Self::CreateDirectory => "create folder",
         }
+    }
+
+    pub const fn is_delete(self) -> bool {
+        matches!(self, Self::Recycle | Self::PermanentDelete)
     }
 }
 
@@ -36,6 +42,9 @@ pub enum OperationIntent {
         destination: PathBuf,
     },
     Recycle {
+        sources: Vec<PathBuf>,
+    },
+    PermanentDelete {
         sources: Vec<PathBuf>,
     },
     Rename {
@@ -54,6 +63,7 @@ impl OperationIntent {
             Self::Copy { .. } => OperationKind::Copy,
             Self::Move { .. } => OperationKind::Move,
             Self::Recycle { .. } => OperationKind::Recycle,
+            Self::PermanentDelete { .. } => OperationKind::PermanentDelete,
             Self::Rename { .. } => OperationKind::Rename,
             Self::CreateDirectory { .. } => OperationKind::CreateDirectory,
         }
@@ -66,6 +76,7 @@ pub enum PlannedStrategy {
     CopyVerifyRemove,
     AtomicRename,
     RecycleBin,
+    PermanentDelete,
     ExclusiveCreate,
 }
 
@@ -76,6 +87,7 @@ impl PlannedStrategy {
             Self::CopyVerifyRemove => "copy, SHA-256 verify, then remove source",
             Self::AtomicRename => "same-volume atomic no-replace rename",
             Self::RecycleBin => "operating-system Recycle Bin / Trash",
+            Self::PermanentDelete => "irreversible recursive deletion",
             Self::ExclusiveCreate => "exclusive create; existing names fail",
         }
     }
@@ -98,6 +110,7 @@ pub struct PlanSummary {
     pub item_count: u64,
     pub file_count: u64,
     pub total_bytes: u64,
+    pub recursive_scope_known: bool,
     pub conflicts: Vec<ConflictSummary>,
     pub warnings: Vec<String>,
 }
@@ -200,6 +213,12 @@ mod tests {
             destination: PathBuf::from("destination"),
         };
         assert_eq!(intent.kind(), OperationKind::Copy);
+
+        let delete = OperationIntent::PermanentDelete {
+            sources: vec![PathBuf::from("source")],
+        };
+        assert_eq!(delete.kind(), OperationKind::PermanentDelete);
+        assert!(delete.kind().is_delete());
     }
 
     #[test]

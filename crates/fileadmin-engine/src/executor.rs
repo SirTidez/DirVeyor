@@ -60,6 +60,14 @@ pub(crate) fn execute(
             &completed_items,
             &failures,
         ),
+        PlannedAction::PermanentDelete { sources } => execute_permanent_delete(
+            &plan,
+            sources,
+            events,
+            cancel_requested,
+            &completed_items,
+            &failures,
+        ),
         PlannedAction::Rename {
             source,
             target,
@@ -480,6 +488,55 @@ fn execute_recycle(
                     format!(
                         "Recycle Bin operation failed; nothing was permanently deleted: {error}"
                     ),
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn execute_permanent_delete(
+    plan: &OperationPlan,
+    sources: &[(PathBuf, Fingerprint)],
+    events: &Sender<OperationEvent>,
+    cancel_requested: &AtomicBool,
+    completed_items: &AtomicU64,
+    failures: &Mutex<Vec<OperationFailure>>,
+) {
+    for (source, fingerprint) in sources {
+        if cancel_requested.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(message) = revalidate(source, fingerprint) {
+            push_failure(failures, Some(source.clone()), message);
+            return;
+        }
+        let result = match fingerprint.kind {
+            crate::planner::ObjectKind::File => fs::remove_file(source),
+            crate::planner::ObjectKind::Directory => fs::remove_dir_all(source),
+        };
+        match result {
+            Ok(()) => {
+                let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
+                send_progress(
+                    events,
+                    plan,
+                    JobPhase::Finalizing,
+                    items,
+                    0,
+                    Some(source.clone()),
+                );
+            }
+            Err(error) => {
+                let context = if fingerprint.kind == crate::planner::ObjectKind::Directory {
+                    "Permanent directory deletion failed and may have removed some descendants"
+                } else {
+                    "Permanent file deletion failed"
+                };
+                push_failure(
+                    failures,
+                    Some(source.clone()),
+                    format!("{context}: {error}"),
                 );
                 return;
             }

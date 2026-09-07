@@ -6,9 +6,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fileadmin_domain::{
-    AppState, EntryKind, FavoritesPanel, FileEntry, FolderSizeProgress, FolderSizeState, LoadState,
-    PaneId, PreviewMatch, PreviewMode, PreviewRegion, PreviewSearchMode, PreviewSession,
-    PreviewState, PreviewWindowDirection, parent_or_same, paths_match,
+    AppState, DeleteMode, EntryKind, FavoritesPanel, FileEntry, FolderSizeProgress,
+    FolderSizeState, LoadState, PaneId, PreviewMatch, PreviewMode, PreviewRegion,
+    PreviewSearchMode, PreviewSession, PreviewState, PreviewWindowDirection, parent_or_same,
+    paths_match,
 };
 use fileadmin_domain::{
     JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
@@ -32,9 +33,14 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 fn main() -> AppResult<()> {
     install_terminal_panic_hook();
 
+    let launch = LaunchContext::from_args();
     let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let right = parent_or_same(&current);
-    let mut app = AppState::new(current, right);
+    let mut app = AppState::new(
+        launch.left.clone().unwrap_or(current),
+        launch.right.clone().unwrap_or(right),
+    );
+    app.active_pane = launch.active;
     let favorites = FavoritesStore::discover();
     app.home_directory = user_home_directory();
     match favorites.load() {
@@ -45,7 +51,7 @@ fn main() -> AppResult<()> {
     let folder_sizes = FolderSizeScanner::new();
     let previews = PreviewLoader::new();
     let operations = OperationEngine::new();
-    queue_initial_drive_scans(&mut app, &scanner);
+    queue_initial_scans(&mut app, &scanner, &launch);
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -159,13 +165,68 @@ fn sync_folder_size(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
     });
 }
 
-fn queue_initial_drive_scans(app: &mut AppState, scanner: &DirectoryScanner) {
+#[derive(Debug)]
+struct LaunchContext {
+    left: Option<PathBuf>,
+    right: Option<PathBuf>,
+    left_focus: Option<PathBuf>,
+    right_focus: Option<PathBuf>,
+    active: PaneId,
+}
+
+impl LaunchContext {
+    fn from_args() -> Self {
+        let mut context = Self {
+            left: None,
+            right: None,
+            left_focus: None,
+            right_focus: None,
+            active: PaneId::Left,
+        };
+        let mut arguments = std::env::args_os().skip(1);
+        while let Some(argument) = arguments.next() {
+            if argument == "--resume-left" {
+                context.left = arguments.next().map(PathBuf::from);
+            } else if argument == "--resume-right" {
+                context.right = arguments.next().map(PathBuf::from);
+            } else if argument == "--resume-left-focus" {
+                context.left_focus = arguments.next().map(PathBuf::from);
+            } else if argument == "--resume-right-focus" {
+                context.right_focus = arguments.next().map(PathBuf::from);
+            } else if argument == "--resume-active" {
+                context.active = match arguments.next().as_deref() {
+                    Some(value) if value == "right" => PaneId::Right,
+                    _ => PaneId::Left,
+                };
+            }
+        }
+        context
+    }
+}
+
+fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner, launch: &LaunchContext) {
     for pane_id in PaneId::ALL {
-        let generation = app.pane_mut(pane_id).begin_drive_list();
+        let resumed = match pane_id {
+            PaneId::Left => launch.left.clone(),
+            PaneId::Right => launch.right.clone(),
+        };
+        let focus = match pane_id {
+            PaneId::Left => launch.left_focus.clone(),
+            PaneId::Right => launch.right_focus.clone(),
+        };
+        let (generation, location) = if let Some(path) = resumed {
+            let generation = app
+                .pane_mut(pane_id)
+                .begin_load_restoring_focus(path.clone(), focus);
+            (generation, ScanLocation::Directory(path))
+        } else {
+            let generation = app.pane_mut(pane_id).begin_drive_list();
+            (generation, ScanLocation::Drives)
+        };
         let request = ScanRequest {
             pane: pane_id,
             generation,
-            location: ScanLocation::Drives,
+            location,
         };
         if let Err(error) = scanner.request(request) {
             app.pane_mut(pane_id)
@@ -417,6 +478,17 @@ fn handle_key(
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+    {
+        app.delete_mode = app.delete_mode.toggle();
+        app.notice = Some(format!(
+            "Delete mode: {} · D applies this mode",
+            app.delete_mode.label()
+        ));
+        return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
     {
         app.favorites_panel = Some(FavoritesPanel::default());
@@ -468,9 +540,7 @@ fn handle_key(
         KeyCode::Char('m') | KeyCode::Char('M') => {
             submit_transfer(app, operations, OperationKind::Move)
         }
-        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-            submit_recycle(app, operations)
-        }
+        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => submit_delete(app, operations),
         KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::F(2) => begin_rename(app),
         KeyCode::Char('n') | KeyCode::Char('N') => begin_create_directory(app),
         KeyCode::Char('p') | KeyCode::Char('P') => begin_preview(app, previews),
@@ -490,12 +560,14 @@ fn drain_operation_events(
                 app.operation = OperationView::Planning { job, kind };
             }
             OperationEvent::PlanReady(summary) => {
+                app.delete_confirmation.clear();
                 app.operation = OperationView::Review(summary);
             }
             OperationEvent::Progress(progress) => {
                 app.operation = OperationView::Running(progress);
             }
             OperationEvent::Finished(report) => {
+                app.delete_confirmation.clear();
                 let outcome = report.outcome;
                 let kind = report.kind;
                 refresh_affected_panes(app, scanner, &report.affected_directories);
@@ -509,6 +581,7 @@ fn drain_operation_events(
                 app.operation = OperationView::Finished(report);
             }
             OperationEvent::Failed { job, kind, message } => {
+                app.delete_confirmation.clear();
                 app.operation = OperationView::Error { job, kind, message };
             }
         }
@@ -516,7 +589,7 @@ fn drain_operation_events(
 }
 
 fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: KeyEvent) {
-    match &app.operation {
+    match app.operation.clone() {
         OperationView::Planning { .. } => {
             if key.code == KeyCode::Esc {
                 operations.cancel();
@@ -524,15 +597,37 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
             }
         }
         OperationView::Review(summary) => match key.code {
+            KeyCode::Enter if summary.kind == OperationKind::PermanentDelete => {
+                if app.delete_confirmation == "DELETE" {
+                    if let Err(error) = operations.approve(summary.job) {
+                        app.notice = Some(submit_error_message(error));
+                    }
+                } else {
+                    app.notice = Some("Type DELETE before confirming permanent deletion".into());
+                }
+            }
             KeyCode::Enter => {
                 if let Err(error) = operations.approve(summary.job) {
                     app.notice = Some(submit_error_message(error));
                 }
             }
+            KeyCode::Backspace if summary.kind == OperationKind::PermanentDelete => {
+                app.delete_confirmation.pop();
+            }
+            KeyCode::Char(character)
+                if summary.kind == OperationKind::PermanentDelete
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && app.delete_confirmation.len() < 16 =>
+            {
+                app.delete_confirmation.extend(character.to_uppercase());
+            }
             KeyCode::Esc => {
                 let job = summary.job;
                 if operations.abandon(job).is_ok() {
                     app.operation = OperationView::Idle;
+                    app.delete_confirmation.clear();
                     app.notice = Some("Operation cancelled; no files changed".into());
                 }
             }
@@ -554,8 +649,35 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
                 app.notice = Some("Cancellation requested; finishing the current safe step".into());
             }
         }
-        OperationView::Finished(_) | OperationView::Error { .. } => {
-            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+        OperationView::Finished(report) => {
+            if is_elevation_shortcut(key)
+                && report.kind.is_delete()
+                && report
+                    .failures
+                    .iter()
+                    .any(|failure| elevation_available(&failure.message))
+            {
+                app.notice = Some(match launch_elevated_fileadmin(app) {
+                    Ok(()) => {
+                        "Opened an elevated FileAdmin at the same locations; approve the UAC prompt"
+                            .into()
+                    }
+                    Err(error) => error,
+                });
+            } else if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                app.operation = OperationView::Idle;
+            }
+        }
+        OperationView::Error { kind, message, .. } => {
+            if is_elevation_shortcut(key) && kind.is_delete() && elevation_available(&message) {
+                app.notice = Some(match launch_elevated_fileadmin(app) {
+                    Ok(()) => {
+                        "Opened an elevated FileAdmin at the same locations; approve the UAC prompt"
+                            .into()
+                    }
+                    Err(error) => error,
+                });
+            } else if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 app.operation = OperationView::Idle;
             }
         }
@@ -649,13 +771,17 @@ fn submit_transfer(app: &mut AppState, operations: &OperationEngine, kind: Opera
     submit_intent(app, operations, intent);
 }
 
-fn submit_recycle(app: &mut AppState, operations: &OperationEngine) {
+fn submit_delete(app: &mut AppState, operations: &OperationEngine) {
     let sources = app.operation_sources();
     if sources.is_empty() {
         app.notice = Some("Select or focus a file or directory first".into());
         return;
     }
-    submit_intent(app, operations, OperationIntent::Recycle { sources });
+    let intent = match app.delete_mode {
+        DeleteMode::Recycle => OperationIntent::Recycle { sources },
+        DeleteMode::Permanent => OperationIntent::PermanentDelete { sources },
+    };
+    submit_intent(app, operations, intent);
 }
 
 fn submit_intent(app: &mut AppState, operations: &OperationEngine, intent: OperationIntent) {
@@ -726,6 +852,149 @@ fn request_quit(app: &mut AppState, operations: &OperationEngine) {
     } else {
         app.should_quit = true;
     }
+}
+
+fn is_elevation_shortcut(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
+}
+
+fn is_permission_denied_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("access is denied")
+        || message.contains("access denied")
+        || message.contains("permission denied")
+        || message.contains("os error 5")
+        || message.contains("os error 13")
+}
+
+fn elevation_available(message: &str) -> bool {
+    cfg!(windows) && is_permission_denied_message(message) && !is_process_elevated()
+}
+
+#[cfg(windows)]
+fn is_process_elevated() -> bool {
+    use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
+
+    // SAFETY: IsUserAnAdmin takes no pointers and only queries the current
+    // process token membership.
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(windows))]
+fn is_process_elevated() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn launch_elevated_fileadmin(app: &AppState) -> Result<(), String> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not locate FileAdmin executable — {error}"))?;
+    let mut arguments = Vec::<OsString>::new();
+    for pane_id in PaneId::ALL {
+        let pane = app.pane(pane_id);
+        if pane.browsing_drives {
+            continue;
+        }
+        arguments.push(
+            match pane_id {
+                PaneId::Left => "--resume-left",
+                PaneId::Right => "--resume-right",
+            }
+            .into(),
+        );
+        arguments.push(pane.location.as_os_str().to_owned());
+        if let Some(focused) = pane.focused() {
+            arguments.push(
+                match pane_id {
+                    PaneId::Left => "--resume-left-focus",
+                    PaneId::Right => "--resume-right-focus",
+                }
+                .into(),
+            );
+            arguments.push(focused.path.as_os_str().to_owned());
+        }
+    }
+    arguments.push("--resume-active".into());
+    arguments.push(
+        match app.active_pane {
+            PaneId::Left => "left",
+            PaneId::Right => "right",
+        }
+        .into(),
+    );
+
+    let verb: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+    let executable: Vec<u16> = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let parameters = windows_command_line(&arguments);
+    // SAFETY: all pointers reference valid NUL-terminated UTF-16 buffers for
+    // the duration of ShellExecuteW. No window handle or working directory is
+    // supplied. The elevated child performs no automatic operation; it merely
+    // reopens FileAdmin at the current locations for a fresh reviewed attempt.
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            executable.as_ptr(),
+            parameters.as_ptr(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize > 32 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows did not launch elevated FileAdmin (ShellExecute code {})",
+            result as isize
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_command_line(arguments: &[std::ffi::OsString]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut command_line = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            command_line.push(b' ' as u16);
+        }
+        command_line.push(b'"' as u16);
+        let mut backslashes = 0;
+        for unit in argument.as_os_str().encode_wide() {
+            if unit == b'\\' as u16 {
+                backslashes += 1;
+            } else if unit == b'"' as u16 {
+                command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+                command_line.push(unit);
+                backslashes = 0;
+            } else {
+                command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+                command_line.push(unit);
+                backslashes = 0;
+            }
+        }
+        command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+        command_line.push(b'"' as u16);
+    }
+    command_line.push(0);
+    command_line
+}
+
+#[cfg(not(windows))]
+fn launch_elevated_fileadmin(_app: &AppState) -> Result<(), String> {
+    Err("In-app elevation is currently available only on Windows".into())
 }
 
 fn submit_error_message(error: SubmitError) -> String {
@@ -1397,8 +1666,8 @@ fn install_terminal_panic_hook() {
 mod preview_tests {
     use super::*;
     use fileadmin_domain::{
-        FileEntry, PreviewCompleteness, PreviewDocument, PreviewEncoding, PreviewKind, PreviewLine,
-        PreviewLineStyle,
+        FileEntry, JobId, PlanSummary, PlannedStrategy, PreviewCompleteness, PreviewDocument,
+        PreviewEncoding, PreviewKind, PreviewLine, PreviewLineStyle,
     };
 
     #[test]
@@ -1406,7 +1675,17 @@ mod preview_tests {
         let scanner = DirectoryScanner::new();
         let mut app = AppState::new(PathBuf::from("left"), PathBuf::from("right"));
 
-        queue_initial_drive_scans(&mut app, &scanner);
+        queue_initial_scans(
+            &mut app,
+            &scanner,
+            &LaunchContext {
+                left: None,
+                right: None,
+                left_focus: None,
+                right_focus: None,
+                active: PaneId::Left,
+            },
+        );
 
         for pane_id in PaneId::ALL {
             let pane = app.pane(pane_id);
@@ -1414,6 +1693,99 @@ mod preview_tests {
             assert!(matches!(pane.load_state, LoadState::Loading));
             assert_eq!(pane.generation, 1);
         }
+    }
+
+    #[test]
+    fn ctrl_d_toggles_the_browse_delete_mode() {
+        let scanner = DirectoryScanner::new();
+        let previews = PreviewLoader::new();
+        let operations = OperationEngine::new();
+        let favorites = FavoritesStore::discover();
+        let mut app = app_with_focused_file();
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            &favorites,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.delete_mode, DeleteMode::Permanent);
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            &favorites,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.delete_mode, DeleteMode::Recycle);
+    }
+
+    #[test]
+    fn permanent_delete_review_requires_the_delete_phrase() {
+        let operations = OperationEngine::new();
+        let mut app = app_with_focused_file();
+        app.operation = OperationView::Review(PlanSummary {
+            job: JobId(99),
+            kind: OperationKind::PermanentDelete,
+            sources: vec![PathBuf::from("target")],
+            destination: None,
+            strategy: PlannedStrategy::PermanentDelete,
+            item_count: 1,
+            file_count: 1,
+            total_bytes: 10,
+            recursive_scope_known: true,
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+        });
+
+        for character in "del".chars() {
+            handle_operation_key(
+                &mut app,
+                &operations,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        handle_operation_key(
+            &mut app,
+            &operations,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.delete_confirmation, "DEL");
+        assert!(matches!(app.operation, OperationView::Review(_)));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Type DELETE before confirming permanent deletion")
+        );
+    }
+
+    #[test]
+    fn elevation_is_offered_only_for_permission_denied_messages() {
+        assert!(is_permission_denied_message(
+            "Access is denied. (os error 5)"
+        ));
+        assert!(is_permission_denied_message(
+            "Permission denied (os error 13)"
+        ));
+        assert!(!is_permission_denied_message("The path was not found"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_resume_arguments_quote_spaces_and_trailing_slashes() {
+        use std::ffi::OsString;
+
+        let encoded = windows_command_line(&[
+            OsString::from("--resume-left"),
+            OsString::from(r"C:\folder with space\"),
+        ]);
+        let rendered = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+
+        assert_eq!(rendered, r#""--resume-left" "C:\folder with space\\""#);
     }
 
     fn app_with_focused_file() -> AppState {
