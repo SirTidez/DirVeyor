@@ -99,6 +99,14 @@ fn drain_folder_size_events(app: &mut AppState, folder_sizes: &FolderSizeScanner
 }
 
 fn sync_folder_size(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
+    if !matches!(app.operation, OperationView::Idle) {
+        if !matches!(app.folder_size, FolderSizeState::Idle) {
+            folder_sizes.cancel();
+            app.folder_size = FolderSizeState::Idle;
+        }
+        return;
+    }
+
     let pane = app.active_pane;
     let generation = app.active().generation;
     let path = app
