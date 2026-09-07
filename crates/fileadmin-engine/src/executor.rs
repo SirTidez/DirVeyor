@@ -1,6 +1,6 @@
 use crate::planner::{
     FileTask, Fingerprint, ObjectKind, OperationPlan, PlannedAction, TransferRoot,
-    keep_both_target, revalidate, revalidate_directory_kind,
+    keep_both_target, read_delete_manifest_entry, revalidate, revalidate_directory_kind,
 };
 use crate::{ConflictResolution, OperationEvent};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender};
@@ -72,9 +72,9 @@ pub(crate) fn execute(
             &completed_items,
             &failures,
         ),
-        PlannedAction::PermanentDelete { roots } => execute_permanent_delete(
+        PlannedAction::PermanentDelete { manifest } => execute_permanent_delete(
             &plan,
-            roots,
+            manifest,
             events,
             cancel_requested,
             &completed_items,
@@ -1325,7 +1325,7 @@ fn execute_recycle(
 #[allow(clippy::too_many_arguments)]
 fn execute_permanent_delete(
     plan: &OperationPlan,
-    roots: &[TransferRoot],
+    manifest: &File,
     events: &Sender<OperationEvent>,
     cancel_requested: &AtomicBool,
     completed_items: &AtomicU64,
@@ -1334,77 +1334,102 @@ fn execute_permanent_delete(
     completed_directories: &AtomicU64,
     failures: &Mutex<Vec<OperationFailure>>,
 ) {
-    for root in roots {
-        if cancel_requested.load(Ordering::Acquire) {
-            return;
-        }
-        if let Err(message) = revalidate(&root.source, &root.source_fingerprint) {
-            push_failure(failures, Some(root.source.clone()), message);
-            return;
-        }
-        for file in &root.files {
-            if cancel_requested.load(Ordering::Acquire) {
-                return;
-            }
-            if let Err(message) = revalidate(&file.source, &file.fingerprint) {
-                push_failure(failures, Some(file.source.clone()), message);
-                return;
-            }
-            if let Err(error) = fs::remove_file(&file.source) {
+    for pass in [ObjectKind::File, ObjectKind::Directory] {
+        let mut reader = match manifest.try_clone() {
+            Ok(reader) => reader,
+            Err(error) => {
                 push_failure(
                     failures,
-                    Some(file.source.clone()),
-                    format!("Permanent file deletion failed: {error}"),
+                    None,
+                    format!("Cannot open temporary delete manifest: {error}"),
                 );
                 return;
             }
-            let bytes = completed_bytes.fetch_add(file.fingerprint.len, Ordering::AcqRel)
-                + file.fingerprint.len;
-            let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
-            let files = completed_files.fetch_add(1, Ordering::AcqRel) + 1;
-            send_delete_progress(
-                events,
-                plan,
-                JobPhase::Running,
-                items,
-                files,
-                completed_directories.load(Ordering::Acquire),
-                bytes,
-                Some(file.source.clone()),
+        };
+        if let Err(error) = reader.seek(SeekFrom::Start(0)) {
+            push_failure(
+                failures,
+                None,
+                format!("Cannot read temporary delete manifest: {error}"),
             );
+            return;
         }
-
-        let mut directories: Vec<_> = root.directories.iter().collect();
-        directories
-            .sort_by_key(|directory| std::cmp::Reverse(directory.source.components().count()));
-        for directory in directories {
+        loop {
             if cancel_requested.load(Ordering::Acquire) {
                 return;
             }
-            if let Err(message) = revalidate_directory_kind(&directory.source) {
-                push_failure(failures, Some(directory.source.clone()), message);
-                return;
+            let entry = match read_delete_manifest_entry(&mut reader) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    push_failure(
+                        failures,
+                        None,
+                        format!("Cannot read temporary delete manifest: {error}"),
+                    );
+                    return;
+                }
+            };
+            let (path, fingerprint) = entry;
+            if fingerprint.kind != pass {
+                continue;
             }
-            if let Err(error) = fs::remove_dir(&directory.source) {
-                push_failure(
-                    failures,
-                    Some(directory.source.clone()),
-                    format!("Permanent directory deletion failed: {error}"),
-                );
-                return;
+            match pass {
+                ObjectKind::File => {
+                    if let Err(message) = revalidate(&path, &fingerprint) {
+                        push_failure(failures, Some(path), message);
+                        return;
+                    }
+                    if let Err(error) = fs::remove_file(&path) {
+                        push_failure(
+                            failures,
+                            Some(path),
+                            format!("Permanent file deletion failed: {error}"),
+                        );
+                        return;
+                    }
+                    let bytes = completed_bytes.fetch_add(fingerprint.len, Ordering::AcqRel)
+                        + fingerprint.len;
+                    let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
+                    let files = completed_files.fetch_add(1, Ordering::AcqRel) + 1;
+                    send_delete_progress(
+                        events,
+                        plan,
+                        JobPhase::Running,
+                        items,
+                        files,
+                        completed_directories.load(Ordering::Acquire),
+                        bytes,
+                        Some(path),
+                    );
+                }
+                ObjectKind::Directory => {
+                    if let Err(message) = revalidate_directory_kind(&path) {
+                        push_failure(failures, Some(path), message);
+                        return;
+                    }
+                    if let Err(error) = fs::remove_dir(&path) {
+                        push_failure(
+                            failures,
+                            Some(path),
+                            format!("Permanent directory deletion failed: {error}"),
+                        );
+                        return;
+                    }
+                    let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
+                    let directories = completed_directories.fetch_add(1, Ordering::AcqRel) + 1;
+                    send_delete_progress(
+                        events,
+                        plan,
+                        JobPhase::Finalizing,
+                        items,
+                        completed_files.load(Ordering::Acquire),
+                        directories,
+                        completed_bytes.load(Ordering::Acquire),
+                        Some(path),
+                    );
+                }
             }
-            let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
-            let directories = completed_directories.fetch_add(1, Ordering::AcqRel) + 1;
-            send_delete_progress(
-                events,
-                plan,
-                JobPhase::Finalizing,
-                items,
-                completed_files.load(Ordering::Acquire),
-                directories,
-                completed_bytes.load(Ordering::Acquire),
-                Some(directory.source.clone()),
-            );
         }
     }
 }

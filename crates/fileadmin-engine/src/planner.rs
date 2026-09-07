@@ -3,12 +3,12 @@ use fileadmin_domain::{
 };
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, Metadata};
+use std::fs::{self, File, Metadata};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-const MAX_PLAN_ITEMS: usize = 100_000;
 const MAX_SOURCES: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,20 +32,13 @@ pub(crate) struct FileTask {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DirectoryTask {
-    pub source: PathBuf,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct TransferRoot {
     pub source: PathBuf,
     pub target: PathBuf,
     pub source_fingerprint: Fingerprint,
-    pub directories: Vec<DirectoryTask>,
-    pub files: Vec<FileTask>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum PlannedAction {
     Transfer {
         roots: Vec<TransferRoot>,
@@ -60,7 +53,7 @@ pub(crate) enum PlannedAction {
         sources: Vec<(PathBuf, Fingerprint, u64)>,
     },
     PermanentDelete {
-        roots: Vec<TransferRoot>,
+        manifest: File,
     },
     Rename {
         source: PathBuf,
@@ -72,7 +65,7 @@ pub(crate) enum PlannedAction {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct OperationPlan {
     pub summary: PlanSummary,
     pub action: PlannedAction,
@@ -223,8 +216,6 @@ fn build_transfer(
             source: source.clone(),
             target: target.clone(),
             source_fingerprint,
-            directories: Vec::new(),
-            files: Vec::new(),
         };
         all_same_volume &= same_volume(source, &destination)?;
         if let Some(parent) = source.parent() {
@@ -452,7 +443,10 @@ fn build_delete(
     check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
     let mut snapshots = Vec::with_capacity(sources.len());
-    let mut delete_roots = Vec::with_capacity(sources.len());
+    let mut delete_manifest = permanent
+        .then(|| tempfile::tempfile().map(BufWriter::new))
+        .transpose()
+        .map_err(|error| format!("Cannot create temporary delete manifest: {error}"))?;
     let mut item_count = 0_u64;
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
@@ -467,27 +461,29 @@ fn build_delete(
         reject_link_or_special(source, &metadata)?;
         let source_fingerprint = fingerprint(&metadata)?;
         if permanent {
-            let mut root = TransferRoot {
-                source: source.clone(),
-                target: source.clone(),
-                source_fingerprint,
-                directories: Vec::new(),
-                files: Vec::new(),
-            };
-            collect_tree(
+            collect_delete_manifest(
                 job,
                 OperationKind::PermanentDelete,
                 source,
-                source,
-                &mut root.directories,
-                &mut root.files,
+                Some(&source_fingerprint),
+                delete_manifest
+                    .as_mut()
+                    .expect("permanent delete manifest should exist"),
                 &mut item_count,
                 &mut file_count,
                 &mut total_bytes,
                 cancelled,
                 progress,
             )?;
-            delete_roots.push(root);
+            publish_transfer_count(
+                job,
+                OperationKind::PermanentDelete,
+                source,
+                item_count,
+                file_count,
+                total_bytes,
+                progress,
+            );
         } else {
             item_count += 1;
             if source_fingerprint.kind == ObjectKind::File {
@@ -515,6 +511,16 @@ fn build_delete(
     }
     affected.sort();
     affected.dedup();
+    let delete_manifest = delete_manifest
+        .map(|mut manifest| {
+            manifest
+                .flush()
+                .map_err(|error| format!("Cannot flush temporary delete manifest: {error}"))?;
+            manifest.into_inner().map_err(|error| {
+                format!("Cannot finish temporary delete manifest: {}", error.error())
+            })
+        })
+        .transpose()?;
 
     let kind = if permanent {
         OperationKind::PermanentDelete
@@ -529,7 +535,7 @@ fn build_delete(
     let warnings = if permanent {
         vec![
             "This operation cannot be undone and does not use the Recycle Bin / Trash".into(),
-            "The reviewed file and folder manifest is removed entry by entry".into(),
+            "The reviewed on-disk file and folder manifest is removed entry by entry".into(),
         ]
     } else {
         let mut warnings = vec![
@@ -546,7 +552,7 @@ fn build_delete(
     };
     let action = if permanent {
         PlannedAction::PermanentDelete {
-            roots: delete_roots,
+            manifest: delete_manifest.expect("permanent delete manifest should exist"),
         }
     } else {
         PlannedAction::Recycle {
@@ -699,13 +705,12 @@ fn validate_source_set(mut sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, String
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_tree(
+fn collect_delete_manifest(
     job: JobId,
     kind: OperationKind,
     source: &Path,
-    target: &Path,
-    directories: &mut Vec<DirectoryTask>,
-    files: &mut Vec<FileTask>,
+    known_fingerprint: Option<&Fingerprint>,
+    manifest: &mut BufWriter<File>,
     item_count: &mut u64,
     file_count: &mut u64,
     total_bytes: &mut u64,
@@ -713,15 +718,16 @@ fn collect_tree(
     progress: &mut dyn FnMut(OperationPlanningProgress),
 ) -> Result<(), String> {
     check_cancelled(cancelled)?;
-    if directories.len() + files.len() >= MAX_PLAN_ITEMS {
-        return Err(format!(
-            "The operation exceeds the current {MAX_PLAN_ITEMS}-item safety limit"
-        ));
-    }
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| format!("Cannot inspect {}: {error}", source.display()))?;
-    reject_link_or_special(source, &metadata)?;
-    let item_fingerprint = fingerprint(&metadata)?;
+    let owned_fingerprint;
+    let item_fingerprint = if let Some(fingerprint) = known_fingerprint {
+        fingerprint
+    } else {
+        let metadata = fs::symlink_metadata(source)
+            .map_err(|error| format!("Cannot inspect {}: {error}", source.display()))?;
+        reject_link_or_special(source, &metadata)?;
+        owned_fingerprint = fingerprint(&metadata)?;
+        &owned_fingerprint
+    };
     *item_count = item_count
         .checked_add(1)
         .ok_or_else(|| "Operation item count overflowed".to_string())?;
@@ -734,16 +740,8 @@ fn collect_tree(
             *total_bytes = total_bytes
                 .checked_add(item_fingerprint.len)
                 .ok_or_else(|| "Operation byte count overflowed".to_string())?;
-            files.push(FileTask {
-                source: source.to_path_buf(),
-                target: target.to_path_buf(),
-                fingerprint: item_fingerprint,
-            });
         }
         ObjectKind::Directory => {
-            directories.push(DirectoryTask {
-                source: source.to_path_buf(),
-            });
             let reader = fs::read_dir(source)
                 .map_err(|error| format!("Cannot enumerate {}: {error}", source.display()))?;
             for child in reader {
@@ -753,13 +751,12 @@ fn collect_tree(
                         source.display()
                     )
                 })?;
-                collect_tree(
+                collect_delete_manifest(
                     job,
                     kind,
                     &child.path(),
-                    &target.join(child.file_name()),
-                    directories,
-                    files,
+                    None,
+                    manifest,
                     item_count,
                     file_count,
                     total_bytes,
@@ -769,16 +766,124 @@ fn collect_tree(
             }
         }
     }
-    progress(OperationPlanningProgress {
-        job,
-        kind,
-        discovered_items: *item_count,
-        discovered_files: *file_count,
-        discovered_directories: item_count.saturating_sub(*file_count),
-        discovered_bytes: *total_bytes,
-        current_path: Some(source.to_path_buf()),
-    });
+    write_delete_manifest_entry(manifest, source, item_fingerprint)
+        .map_err(|error| format!("Cannot write temporary delete manifest: {error}"))?;
+    if *item_count == 1 || (*item_count).is_multiple_of(128) {
+        publish_transfer_count(
+            job,
+            kind,
+            source,
+            *item_count,
+            *file_count,
+            *total_bytes,
+            progress,
+        );
+    }
     Ok(())
+}
+
+fn write_delete_manifest_entry(
+    file: &mut impl Write,
+    path: &Path,
+    fingerprint: &Fingerprint,
+) -> io::Result<()> {
+    let encoded = encode_manifest_path(path);
+    let length = u32::try_from(encoded.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Path is too long"))?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&encoded)?;
+    file.write_all(&[match fingerprint.kind {
+        ObjectKind::File => 0,
+        ObjectKind::Directory => 1,
+    }])?;
+    file.write_all(&fingerprint.len.to_le_bytes())?;
+    let modified = fingerprint
+        .modified
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    file.write_all(
+        &modified
+            .map_or(u64::MAX, |value| value.as_secs())
+            .to_le_bytes(),
+    )?;
+    file.write_all(
+        &modified
+            .map_or(0, |value| value.subsec_nanos())
+            .to_le_bytes(),
+    )
+}
+
+pub(crate) fn read_delete_manifest_entry(
+    file: &mut File,
+) -> io::Result<Option<(PathBuf, Fingerprint)>> {
+    let mut length = [0_u8; 4];
+    match file.read_exact(&mut length) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut encoded = vec![0_u8; u32::from_le_bytes(length) as usize];
+    file.read_exact(&mut encoded)?;
+    let mut kind = [0_u8; 1];
+    file.read_exact(&mut kind)?;
+    let kind = match kind[0] {
+        0 => ObjectKind::File,
+        1 => ObjectKind::Directory,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid object kind",
+            ));
+        }
+    };
+    let mut len = [0_u8; 8];
+    file.read_exact(&mut len)?;
+    let mut seconds = [0_u8; 8];
+    file.read_exact(&mut seconds)?;
+    let mut nanos = [0_u8; 4];
+    file.read_exact(&mut nanos)?;
+    let seconds = u64::from_le_bytes(seconds);
+    let modified = (seconds != u64::MAX).then(|| {
+        std::time::UNIX_EPOCH + std::time::Duration::new(seconds, u32::from_le_bytes(nanos))
+    });
+    Ok(Some((
+        decode_manifest_path(encoded),
+        Fingerprint {
+            kind,
+            len: u64::from_le_bytes(len),
+            modified,
+        },
+    )))
+}
+
+#[cfg(windows)]
+fn encode_manifest_path(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(windows)]
+fn decode_manifest_path(bytes: Vec<u8>) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    std::ffi::OsString::from_wide(&units).into()
+}
+
+#[cfg(unix)]
+fn encode_manifest_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn decode_manifest_path(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(bytes).into()
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
@@ -998,6 +1103,7 @@ fn same_volume(_source: &Path, _destination: &Path) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Seek;
 
     #[test]
     fn suffix_preserves_file_extension() {
@@ -1136,8 +1242,7 @@ mod tests {
         let PlannedAction::Transfer { roots, .. } = plan.action else {
             panic!("expected a streaming transfer");
         };
-        assert!(roots[0].files.is_empty());
-        assert!(roots[0].directories.is_empty());
+        assert_eq!(roots.len(), 1);
     }
 
     #[test]
@@ -1159,6 +1264,30 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "Source and destination resolve to the same item");
+    }
+
+    #[test]
+    fn delete_manifest_is_not_limited_to_one_hundred_thousand_entries() {
+        let mut manifest = tempfile::tempfile().unwrap();
+        let fingerprint = Fingerprint {
+            kind: ObjectKind::File,
+            len: 1,
+            modified: None,
+        };
+        for number in 0..=100_000_u32 {
+            write_delete_manifest_entry(
+                &mut manifest,
+                &PathBuf::from(format!("entry-{number}")),
+                &fingerprint,
+            )
+            .unwrap();
+        }
+        manifest.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut entries = 0_u32;
+        while read_delete_manifest_entry(&mut manifest).unwrap().is_some() {
+            entries += 1;
+        }
+        assert_eq!(entries, 100_001);
     }
 
     #[test]
