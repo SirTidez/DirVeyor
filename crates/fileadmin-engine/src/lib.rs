@@ -8,8 +8,8 @@ mod planner;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use fileadmin_domain::{
-    JobId, OperationIntent, OperationPlanningProgress, OperationProgress, OperationReport,
-    PlanSummary,
+    ConflictAction, JobId, OperationIntent, OperationPlanningProgress, OperationProgress,
+    OperationReport, PlanSummary, TransferConflict,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +23,7 @@ pub enum OperationEvent {
     Planning(OperationPlanningProgress),
     PlanReady(PlanSummary),
     Progress(OperationProgress),
+    Conflict(TransferConflict),
     Finished(OperationReport),
     Failed {
         job: Option<JobId>,
@@ -49,19 +50,36 @@ pub struct OperationEngine {
     busy: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
     next_job: AtomicU64,
+    conflict_resolutions: Sender<ConflictResolution>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConflictResolution {
+    pub job: JobId,
+    pub action: ConflictAction,
+    pub apply_to_all: bool,
 }
 
 impl OperationEngine {
     pub fn new() -> Self {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (conflict_tx, conflict_rx) = bounded(1);
         let busy = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let worker_busy = Arc::clone(&busy);
         let worker_cancel = Arc::clone(&cancel_requested);
         thread::Builder::new()
             .name("fileadmin-operation-coordinator".into())
-            .spawn(move || coordinator(command_rx, event_tx, worker_busy, worker_cancel))
+            .spawn(move || {
+                coordinator(
+                    command_rx,
+                    event_tx,
+                    conflict_rx,
+                    worker_busy,
+                    worker_cancel,
+                )
+            })
             .expect("failed to start operation coordinator");
 
         Self {
@@ -70,6 +88,7 @@ impl OperationEngine {
             busy,
             cancel_requested,
             next_job: AtomicU64::new(1),
+            conflict_resolutions: conflict_tx,
         }
     }
 
@@ -114,6 +133,24 @@ impl OperationEngine {
         self.cancel_requested.store(true, Ordering::Release);
     }
 
+    pub fn resolve_conflict(
+        &self,
+        job: JobId,
+        action: ConflictAction,
+        apply_to_all: bool,
+    ) -> Result<(), SubmitError> {
+        self.conflict_resolutions
+            .try_send(ConflictResolution {
+                job,
+                action,
+                apply_to_all,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SubmitError::Busy,
+                TrySendError::Disconnected(_) => SubmitError::Closed,
+            })
+    }
+
     pub fn try_recv(&self) -> Result<OperationEvent, TryRecvError> {
         self.events.try_recv()
     }
@@ -132,6 +169,7 @@ impl Default for OperationEngine {
 fn coordinator(
     commands: Receiver<Command>,
     events: Sender<OperationEvent>,
+    conflict_resolutions: Receiver<ConflictResolution>,
     busy: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
 ) {
@@ -191,7 +229,8 @@ fn coordinator(
                 let Some(plan) = pending.take().filter(|plan| plan.summary.job == job) else {
                     continue;
                 };
-                let report = executor::execute(plan, &events, &cancel_requested);
+                let report =
+                    executor::execute(plan, &events, &conflict_resolutions, &cancel_requested);
                 let _ = events.send(OperationEvent::Finished(report));
                 busy.store(false, Ordering::Release);
             }

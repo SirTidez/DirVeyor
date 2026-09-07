@@ -1,7 +1,8 @@
 use fileadmin_domain::{
-    AppState, DriveInfo, DriveKind, EntryKind, FolderSizeState, JobOutcome, JobPhase, LoadState,
-    OperationKind, OperationView, PaneId, PaneState, PlanSummary, PreviewLine, PreviewLineStyle,
-    PreviewMode, PreviewRegion, PreviewSession, PreviewState, TextAction, TextPrompt,
+    AppState, ConflictKind, ConflictPrompt, DriveInfo, DriveKind, EntryKind, FolderSizeState,
+    JobOutcome, JobPhase, LoadState, OperationKind, OperationView, PaneId, PaneState, PlanSummary,
+    PreviewLine, PreviewLineStyle, PreviewMode, PreviewRegion, PreviewSession, PreviewState,
+    TextAction, TextPrompt, VersionRelation,
 };
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -36,6 +37,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     .areas(area);
 
     render_header(frame, header, app);
+    let transfer_source = app.transfer_source_pane();
     if body.width >= INSPECTOR_WIDTH_THRESHOLD {
         let [left, right, inspector] = Layout::horizontal([
             Constraint::Percentage(38),
@@ -48,12 +50,16 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             left,
             app.pane(PaneId::Left),
             app.active_pane == PaneId::Left,
+            PaneId::Left,
+            transfer_source,
         );
         render_pane(
             frame,
             right,
             app.pane(PaneId::Right),
             app.active_pane == PaneId::Right,
+            PaneId::Right,
+            transfer_source,
         );
         render_inspector(frame, inspector, app);
     } else {
@@ -65,12 +71,16 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             left,
             app.pane(PaneId::Left),
             app.active_pane == PaneId::Left,
+            PaneId::Left,
+            transfer_source,
         );
         render_pane(
             frame,
             right,
             app.pane(PaneId::Right),
             app.active_pane == PaneId::Right,
+            PaneId::Right,
+            transfer_source,
         );
     }
     render_footer(frame, footer, app);
@@ -495,6 +505,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
             Some(format!("Review {} before execution", summary.kind.label()))
         }
         OperationView::Running(progress) => Some(progress_status(progress)),
+        OperationView::Conflict(_) => Some("Transfer waiting for a conflict choice".into()),
         OperationView::Finished(report) => Some(format!(
             "{} {}",
             outcome_label(report.outcome),
@@ -520,7 +531,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_pane(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool) {
+fn render_pane(
+    frame: &mut Frame,
+    area: Rect,
+    pane: &PaneState,
+    active: bool,
+    pane_id: PaneId,
+    transfer_source: PaneId,
+) {
     let border_style = if active {
         Style::default().fg(Color::Cyan)
     } else {
@@ -532,7 +550,17 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool) {
     } else {
         safe_text(&pane.location.to_string_lossy())
     };
-    let title = format!(" {} ", truncate(&location, path_width));
+    let route = match (pane_id, transfer_source) {
+        (PaneId::Left, PaneId::Left) => " [SOURCE →]",
+        (PaneId::Right, PaneId::Left) => " [→ DESTINATION]",
+        (PaneId::Right, PaneId::Right) => " [← SOURCE]",
+        (PaneId::Left, PaneId::Right) => " [DESTINATION ←]",
+    };
+    let title = format!(
+        " {}{} ",
+        truncate(&location, path_width.saturating_sub(route.len())),
+        route
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -819,6 +847,10 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
             "P Preview · C Copy · M Move",
             Style::default().fg(Color::Cyan),
         ),
+        Line::styled(
+            format!("Ctrl+V Verify: {}", app.transfer_verification.label()),
+            Style::default().fg(Color::Cyan),
+        ),
         Line::styled(delete_action, Style::default().fg(Color::Cyan)),
         Line::styled("R Rename · N Folder", Style::default().fg(Color::Cyan)),
     ]);
@@ -1034,6 +1066,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw("/                  Filter active pane"),
         Line::raw("H / S              Toggle dotfiles / cycle sort"),
         Line::raw("C / M              Plan copy / move to other pane"),
+        Line::raw("Ctrl+V             Toggle Full / Fast verification"),
         Line::raw("D / Delete         Plan using the current delete mode"),
         Line::raw("Ctrl+D             Toggle Recycle / permanent delete"),
         Line::raw("R / F2 / N         Rename item / create folder"),
@@ -1041,7 +1074,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw("Q / Ctrl+C         Quit"),
         Line::raw(""),
         Line::styled(
-            "All mutations are planned and reviewed first. Existing destinations are never overwritten.",
+            "All mutations are reviewed first. Transfer conflicts pause for a source/destination choice.",
             Style::default().fg(Color::Yellow),
         ),
         Line::raw(""),
@@ -1192,11 +1225,93 @@ fn render_operation(frame: &mut Frame, area: Rect, app: &AppState) {
             render_review(frame, area, summary, &app.delete_confirmation)
         }
         OperationView::Running(progress) => render_running(frame, area, progress),
+        OperationView::Conflict(prompt) => render_conflict(frame, area, prompt),
         OperationView::Finished(report) => render_finished(frame, area, report),
         OperationView::Error { kind, message, .. } => {
             render_operation_error(frame, area, *kind, message)
         }
     }
+}
+
+fn render_conflict(frame: &mut Frame, area: Rect, prompt: &ConflictPrompt) {
+    let conflict = &prompt.conflict;
+    let relation = match conflict.relation {
+        VersionRelation::SourceNewer => "SOURCE is newer",
+        VersionRelation::DestinationNewer => "DESTINATION is newer",
+        VersionRelation::SameTimestamp => {
+            "Same timestamp; contents differ or comparison is unresolved"
+        }
+        VersionRelation::Unknown => "Older/newer is unknown",
+    };
+    let mut lines = vec![
+        Line::styled(
+            "A destination item already exists",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(relation),
+        Line::raw(""),
+        Line::styled("SOURCE", Style::default().fg(Color::Cyan)),
+        Line::raw(safe_text(&conflict.source.to_string_lossy())),
+        Line::raw(format!(
+            "{} · Modified {}",
+            human_size(conflict.source_bytes),
+            modified_label(conflict.source_modified)
+        )),
+        Line::raw(""),
+        Line::styled("DESTINATION", Style::default().fg(Color::Cyan)),
+        Line::raw(safe_text(&conflict.destination.to_string_lossy())),
+        Line::raw(format!(
+            "{} · Modified {}",
+            human_size(conflict.destination_bytes),
+            modified_label(conflict.destination_modified)
+        )),
+        Line::raw(""),
+    ];
+    if conflict.kind == ConflictKind::TypeMismatch {
+        lines.push(Line::styled(
+            "File/folder type mismatch: only choices 4, 5, and 6 are available",
+            Style::default().fg(Color::Red),
+        ));
+    } else {
+        lines.push(Line::raw("1 Keep newer       2 Keep older"));
+        lines.push(Line::raw("3 Keep source      4 Keep destination"));
+    }
+    lines.push(Line::raw(
+        "5 Keep both        6 Skip (leave source unchanged)",
+    ));
+    lines.push(Line::styled(
+        "During Move, choosing destination/older/newer may discard the losing source; Skip retains it",
+        Style::default().fg(Color::Yellow),
+    ));
+    lines.push(Line::styled(
+        format!(
+            "A Apply to all {} conflicts: {}",
+            if conflict.kind == ConflictKind::FileToFile {
+                "file/file"
+            } else {
+                "type"
+            },
+            if prompt.apply_to_all { "ON" } else { "OFF" }
+        ),
+        Style::default().fg(if prompt.apply_to_all {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    ));
+    lines.push(Line::styled(
+        "Esc / X Cancel safely",
+        Style::default().fg(Color::Yellow),
+    ));
+    render_modal(
+        frame,
+        centered_rect(88, 78, area),
+        " Resolve conflict ",
+        lines,
+        Color::Yellow,
+    );
 }
 
 fn render_planning(
@@ -1270,6 +1385,12 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_co
         lines.push(Line::raw(format!(
             "Destination: {}",
             safe_text(&destination.to_string_lossy())
+        )));
+    }
+    if let Some(verification) = summary.verification {
+        lines.push(Line::raw(format!(
+            "Verification: {} · Ctrl+V changes the default before planning",
+            verification.label()
         )));
     }
     lines.push(Line::raw(""));
@@ -1355,7 +1476,9 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary, delete_co
 
 fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::OperationProgress) {
     let popup = centered_rect(78, 42, area);
-    let percent = if progress.kind.is_delete() {
+    let percent = if !progress.scope_complete {
+        None
+    } else if progress.kind.is_delete() {
         progress_percent(progress.completed_items, progress.total_items)
     } else {
         progress_percent(progress.completed_bytes, progress.total_bytes)
@@ -1373,7 +1496,14 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::raw(progress_bar(percent.unwrap_or(0), 36)),
+        if let Some(percent) = percent {
+            Line::raw(progress_bar(percent, 36))
+        } else {
+            Line::styled(
+                format!("{} Streaming · totals still growing", folder_size_spinner()),
+                Style::default().fg(Color::Cyan),
+            )
+        },
     ];
     if progress.kind.is_delete() {
         lines.push(Line::raw(format!(
@@ -1400,10 +1530,17 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
             ));
         }
     } else {
-        lines.push(Line::raw(format!(
-            "Items: {} / {}",
-            progress.completed_items, progress.total_items
-        )));
+        lines.push(Line::raw(if progress.scope_complete {
+            format!(
+                "Items: {} / {}",
+                progress.completed_items, progress.total_items
+            )
+        } else {
+            format!(
+                "Entries: {} completed · {} discovered",
+                progress.completed_items, progress.total_items
+            )
+        }));
         lines.push(Line::raw(format!(
             "Transferred: {} / {}",
             human_size(progress.completed_bytes),
@@ -1597,7 +1734,9 @@ fn outcome_label(outcome: JobOutcome) -> &'static str {
 }
 
 fn progress_status(progress: &fileadmin_domain::OperationProgress) -> String {
-    let percent = if progress.kind.is_delete() {
+    let percent = if !progress.scope_complete {
+        None
+    } else if progress.kind.is_delete() {
         progress_percent(progress.completed_items, progress.total_items)
     } else {
         progress_percent(progress.completed_bytes, progress.total_bytes)
@@ -1863,6 +2002,51 @@ mod tests {
     }
 
     #[test]
+    fn inactive_selection_marks_the_source_and_active_destination() {
+        let mut app = populated_app();
+        app.pane_mut(PaneId::Left)
+            .selected
+            .insert(PathBuf::from("left").join("example.txt"));
+        app.active_pane = PaneId::Right;
+
+        let screen = rendered_screen(&app, 160, 35);
+        assert!(screen.contains("[SOURCE →]"));
+        assert!(screen.contains("[→ DESTINATION]"));
+        assert!(screen.contains("Ctrl+V Verify: Full (SHA-256)"));
+    }
+
+    #[test]
+    fn file_conflict_declares_versions_and_all_six_choices() {
+        let mut app = populated_app();
+        app.operation = OperationView::Conflict(ConflictPrompt {
+            conflict: fileadmin_domain::TransferConflict {
+                job: JobId(44),
+                kind: ConflictKind::FileToFile,
+                source: PathBuf::from("left/newer.dat"),
+                destination: PathBuf::from("right/newer.dat"),
+                source_bytes: 2_048,
+                destination_bytes: 1_024,
+                source_modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2)),
+                destination_modified: Some(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                ),
+                relation: VersionRelation::SourceNewer,
+            },
+            apply_to_all: true,
+        });
+
+        let screen = rendered_screen(&app, 160, 40);
+        assert!(screen.contains("SOURCE is newer"));
+        assert!(screen.contains("1 Keep newer"));
+        assert!(screen.contains("2 Keep older"));
+        assert!(screen.contains("3 Keep source"));
+        assert!(screen.contains("4 Keep destination"));
+        assert!(screen.contains("5 Keep both"));
+        assert!(screen.contains("6 Skip"));
+        assert!(screen.contains("Apply to all file/file conflicts: ON"));
+    }
+
+    #[test]
     fn renders_minimum_size_message_for_small_terminal() {
         let backend = TestBackend::new(60, 15);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1952,6 +2136,7 @@ mod tests {
             recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: vec!["Sources remain until verification succeeds".into()],
+            verification: Some(fileadmin_domain::VerificationMode::Full),
         });
 
         let screen = rendered_screen(&app, 160, 35);
@@ -1983,6 +2168,7 @@ mod tests {
             recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: vec!["This operation cannot be undone".into()],
+            verification: None,
         });
 
         let review = rendered_screen(&app, 160, 35);
@@ -2007,6 +2193,7 @@ mod tests {
             total_directories: 0,
             completed_bytes: 512,
             total_bytes: 1_024,
+            scope_complete: true,
             current_path: Some(PathBuf::from("right").join("example.txt")),
         });
 
@@ -2046,6 +2233,7 @@ mod tests {
             total_directories: 212,
             completed_bytes: 4 * 1024 * 1024,
             total_bytes: 8 * 1024 * 1024,
+            scope_complete: true,
             current_path: Some(PathBuf::from("large-tree").join("content.bin")),
         });
         let running = rendered_screen(&app, 140, 35);

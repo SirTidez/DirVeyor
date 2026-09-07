@@ -478,6 +478,7 @@ pub struct AppState {
     pub favorites_panel: Option<FavoritesPanel>,
     pub delete_mode: DeleteMode,
     pub delete_confirmation: String,
+    pub transfer_verification: VerificationMode,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -528,6 +529,7 @@ impl AppState {
             favorites_panel: None,
             delete_mode: DeleteMode::Recycle,
             delete_confirmation: String::new(),
+            transfer_verification: VerificationMode::Full,
         }
     }
 
@@ -565,6 +567,30 @@ impl AppState {
                 .unwrap_or_default();
         }
 
+        let mut sources: Vec<_> = pane.selected.iter().cloned().collect();
+        sources.sort();
+        sources
+    }
+
+    pub fn transfer_source_pane(&self) -> PaneId {
+        if !self.active().selected.is_empty() {
+            self.active_pane
+        } else if !self.pane(self.active_pane.other()).selected.is_empty() {
+            self.active_pane.other()
+        } else {
+            self.active_pane
+        }
+    }
+
+    pub fn transfer_sources(&self) -> Vec<PathBuf> {
+        let pane = self.pane(self.transfer_source_pane());
+        if pane.selected.is_empty() {
+            return pane
+                .focused()
+                .filter(|entry| !entry.is_virtual_location())
+                .map(|entry| vec![entry.path.clone()])
+                .unwrap_or_default();
+        }
         let mut sources: Vec<_> = pane.selected.iter().cloned().collect();
         sources.sort();
         sources
@@ -610,6 +636,18 @@ mod tests {
         assert_eq!(pane.focused().unwrap().display_name, "beta");
         assert!(pane.selected.contains(Path::new("alpha")));
         assert!(!pane.selected.contains(Path::new("beta")));
+    }
+
+    #[test]
+    fn inactive_pane_selection_defines_the_transfer_route() {
+        let mut app = AppState::new(PathBuf::from("left"), PathBuf::from("right"));
+        app.pane_mut(PaneId::Left)
+            .selected
+            .insert(PathBuf::from("left/game"));
+        app.active_pane = PaneId::Right;
+
+        assert_eq!(app.transfer_source_pane(), PaneId::Left);
+        assert_eq!(app.transfer_sources(), vec![PathBuf::from("left/game")]);
     }
 
     #[test]

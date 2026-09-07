@@ -1,6 +1,5 @@
 use fileadmin_domain::{
-    ConflictSummary, JobId, OperationIntent, OperationKind, OperationPlanningProgress, PlanSummary,
-    PlannedStrategy,
+    JobId, OperationIntent, OperationKind, OperationPlanningProgress, PlanSummary, PlannedStrategy,
 };
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
@@ -34,8 +33,6 @@ pub(crate) struct FileTask {
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryTask {
     pub source: PathBuf,
-    pub target: PathBuf,
-    pub fingerprint: Fingerprint,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +50,7 @@ pub(crate) enum PlannedAction {
         roots: Vec<TransferRoot>,
         remove_sources: bool,
         worker_count: usize,
+        verification: fileadmin_domain::VerificationMode,
     },
     AtomicMove {
         roots: Vec<TransferRoot>,
@@ -101,24 +99,26 @@ pub(crate) fn build_plan_with_progress(
         OperationIntent::Copy {
             sources,
             destination,
+            verification,
         } => build_transfer(
             job,
             OperationKind::Copy,
             sources,
             destination,
             cancelled,
-            progress,
+            verification,
         ),
         OperationIntent::Move {
             sources,
             destination,
+            verification,
         } => build_transfer(
             job,
             OperationKind::Move,
             sources,
             destination,
             cancelled,
-            progress,
+            verification,
         ),
         OperationIntent::Recycle { sources } => {
             build_delete(job, sources, false, cancelled, progress)
@@ -151,7 +151,7 @@ fn build_transfer(
     sources: Vec<PathBuf>,
     destination: PathBuf,
     cancelled: &AtomicBool,
-    progress: &mut dyn FnMut(OperationPlanningProgress),
+    verification: fileadmin_domain::VerificationMode,
 ) -> Result<OperationPlan, String> {
     check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
@@ -165,11 +165,12 @@ fn build_transfer(
         .map_err(|error| format!("Cannot resolve destination: {error}"))?;
 
     let mut roots = Vec::with_capacity(sources.len());
-    let mut conflicts = Vec::new();
+    let conflicts = Vec::new();
     let mut item_count = 0_u64;
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
     let mut all_same_volume = true;
+    let mut every_target_clear = true;
     let mut affected = vec![destination.clone()];
 
     for source in &sources {
@@ -193,35 +194,40 @@ fn build_transfer(
             .file_name()
             .ok_or_else(|| "A selected source has no file name".to_string())?;
         let requested_target = destination.join(leaf);
-        let target = keep_both_target(&requested_target, source_fingerprint.kind)?;
-        if target != requested_target {
-            conflicts.push(ConflictSummary {
-                source: source.clone(),
-                requested_destination: requested_target,
-                resolved_destination: target.clone(),
-            });
+        let target_exists = requested_target
+            .try_exists()
+            .map_err(|error| format!("Cannot inspect destination: {error}"))?;
+        if target_exists {
+            let canonical_target = fs::canonicalize(&requested_target).map_err(|error| {
+                format!(
+                    "Cannot resolve destination item {}: {error}",
+                    requested_target.display()
+                )
+            })?;
+            if canonical_target == canonical_source {
+                return Err("Source and destination resolve to the same item".into());
+            }
         }
+        every_target_clear &= !target_exists;
+        let target = requested_target;
 
-        let mut root = TransferRoot {
+        let root = TransferRoot {
             source: source.clone(),
             target: target.clone(),
             source_fingerprint,
             directories: Vec::new(),
             files: Vec::new(),
         };
-        collect_tree(
-            job,
-            kind,
-            source,
-            &target,
-            &mut root.directories,
-            &mut root.files,
-            &mut item_count,
-            &mut file_count,
-            &mut total_bytes,
-            cancelled,
-            progress,
-        )?;
+        item_count += 1;
+        match root.source_fingerprint.kind {
+            ObjectKind::File => {
+                file_count += 1;
+                total_bytes = total_bytes
+                    .checked_add(root.source_fingerprint.len)
+                    .ok_or_else(|| "Operation byte count overflowed".to_string())?;
+            }
+            ObjectKind::Directory => {}
+        }
         all_same_volume &= same_volume(source, &destination)?;
         if let Some(parent) = source.parent() {
             affected.push(parent.to_path_buf());
@@ -232,7 +238,9 @@ fn build_transfer(
     affected.sort();
     affected.dedup();
     let strategy = match kind {
-        OperationKind::Move if all_same_volume => PlannedStrategy::AtomicRename,
+        OperationKind::Move if all_same_volume && every_target_clear => {
+            PlannedStrategy::AtomicRename
+        }
         OperationKind::Move => PlannedStrategy::CopyVerifyRemove,
         OperationKind::Copy => PlannedStrategy::ParallelCopy,
         _ => unreachable!(),
@@ -246,17 +254,22 @@ fn build_transfer(
             .clamp(1, 2)
     };
     let warnings = match strategy {
-        PlannedStrategy::CopyVerifyRemove => vec![
-            "Sources are removed only after every copied file passes SHA-256 verification".into(),
-        ],
+        PlannedStrategy::CopyVerifyRemove => vec![format!(
+            "Sources remain until the streamed copy completes using {} verification",
+            verification.label()
+        )],
         PlannedStrategy::ParallelCopy => vec![
-            "Existing destinations are never overwritten; conflicts receive a numbered name".into(),
+            "Directories stream without a fixed item limit; colliding files pause for a choice"
+                .into(),
         ],
         PlannedStrategy::AtomicRename => {
             vec!["The same-volume rename is a non-interruptible finalization step".into()]
         }
         _ => Vec::new(),
     };
+    let recursive_scope_known = roots
+        .iter()
+        .all(|root| root.source_fingerprint.kind == ObjectKind::File);
     let action = if strategy == PlannedStrategy::AtomicRename {
         PlannedAction::AtomicMove { roots }
     } else {
@@ -264,6 +277,7 @@ fn build_transfer(
             roots,
             remove_sources: kind == OperationKind::Move,
             worker_count,
+            verification,
         }
     };
     Ok(OperationPlan {
@@ -277,9 +291,10 @@ fn build_transfer(
             file_count,
             directory_count: item_count.saturating_sub(file_count),
             total_bytes,
-            recursive_scope_known: true,
+            recursive_scope_known,
             conflicts,
             warnings,
+            verification: Some(verification),
         },
         action,
         affected_directories: affected,
@@ -415,6 +430,7 @@ fn build_delete(
             recursive_scope_known,
             conflicts: Vec::new(),
             warnings,
+            verification: None,
         },
         action,
         affected_directories: affected,
@@ -463,6 +479,7 @@ fn build_rename(
             recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: vec!["Existing destinations are never overwritten".into()],
+            verification: None,
         },
         action: PlannedAction::Rename {
             source,
@@ -508,6 +525,7 @@ fn build_mkdir(
             recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: Vec::new(),
+            verification: None,
         },
         action: PlannedAction::CreateDirectory { target },
         affected_directories: vec![parent],
@@ -584,8 +602,6 @@ fn collect_tree(
         ObjectKind::Directory => {
             directories.push(DirectoryTask {
                 source: source.to_path_buf(),
-                target: target.to_path_buf(),
-                fingerprint: item_fingerprint,
             });
             let reader = fs::read_dir(source)
                 .map_err(|error| format!("Cannot enumerate {}: {error}", source.display()))?;
@@ -706,7 +722,7 @@ fn is_windows_reparse_point(_metadata: &Metadata) -> bool {
     false
 }
 
-fn keep_both_target(requested: &Path, kind: ObjectKind) -> Result<PathBuf, String> {
+pub(crate) fn keep_both_target(requested: &Path, kind: ObjectKind) -> Result<PathBuf, String> {
     if !requested
         .try_exists()
         .map_err(|error| format!("Cannot inspect destination: {error}"))?
@@ -892,6 +908,7 @@ mod tests {
         let intent = OperationIntent::Copy {
             sources: vec![PathBuf::from("missing-source")],
             destination: PathBuf::from("missing-destination"),
+            verification: fileadmin_domain::VerificationMode::Full,
         };
 
         let error = build_plan(JobId(1), intent, &cancelled).unwrap_err();
@@ -935,6 +952,56 @@ mod tests {
             permanent.action,
             PlannedAction::PermanentDelete { .. }
         ));
+    }
+
+    #[test]
+    fn transfer_plan_does_not_enumerate_directory_contents() {
+        let source_parent = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let root = source_parent.path().join("large-tree");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("child.txt"), b"not planned individually").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let plan = build_plan(
+            JobId(4),
+            OperationIntent::Copy {
+                sources: vec![root],
+                destination: destination.path().to_path_buf(),
+                verification: fileadmin_domain::VerificationMode::Full,
+            },
+            &cancelled,
+        )
+        .unwrap();
+
+        assert_eq!(plan.summary.item_count, 1);
+        assert!(!plan.summary.recursive_scope_known);
+        let PlannedAction::Transfer { roots, .. } = plan.action else {
+            panic!("expected a streaming transfer");
+        };
+        assert!(roots[0].files.is_empty());
+        assert!(roots[0].directories.is_empty());
+    }
+
+    #[test]
+    fn transfer_rejects_source_and_destination_identity() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("same.txt");
+        fs::write(&source, b"keep me").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let error = build_plan(
+            JobId(5),
+            OperationIntent::Move {
+                sources: vec![source],
+                destination: parent.path().to_path_buf(),
+                verification: fileadmin_domain::VerificationMode::Full,
+            },
+            &cancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Source and destination resolve to the same item");
     }
 
     #[cfg(windows)]

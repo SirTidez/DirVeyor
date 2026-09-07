@@ -12,8 +12,8 @@ use fileadmin_domain::{
     paths_match,
 };
 use fileadmin_domain::{
-    JobId, JobOutcome, OperationIntent, OperationKind, OperationPlanningProgress, OperationView,
-    TextAction, TextPrompt,
+    ConflictAction, ConflictKind, ConflictPrompt, JobId, JobOutcome, OperationIntent,
+    OperationKind, OperationPlanningProgress, OperationView, TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
 use fileadmin_fs::{
@@ -490,6 +490,17 @@ fn handle_key(
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+    {
+        app.transfer_verification = app.transfer_verification.toggle();
+        app.notice = Some(format!(
+            "Transfer verification: {}",
+            app.transfer_verification.label()
+        ));
+        return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
     {
         app.favorites_panel = Some(FavoritesPanel::default());
@@ -566,6 +577,12 @@ fn drain_operation_events(
             }
             OperationEvent::Progress(progress) => {
                 app.operation = OperationView::Running(progress);
+            }
+            OperationEvent::Conflict(conflict) => {
+                app.operation = OperationView::Conflict(ConflictPrompt {
+                    conflict,
+                    apply_to_all: false,
+                });
             }
             OperationEvent::Finished(report) => {
                 app.delete_confirmation.clear();
@@ -648,6 +665,51 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
                 progress.phase = fileadmin_domain::JobPhase::Cancelling;
                 app.operation = OperationView::Running(progress);
                 app.notice = Some("Cancellation requested; finishing the current safe step".into());
+            }
+        }
+        OperationView::Conflict(mut prompt) => {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('x') | KeyCode::Char('X')
+            ) {
+                operations.cancel();
+                app.notice = Some("Cancellation requested at conflict".into());
+                return;
+            }
+            if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
+                prompt.apply_to_all = !prompt.apply_to_all;
+                app.operation = OperationView::Conflict(prompt);
+                return;
+            }
+            let action = match key.code {
+                KeyCode::Char('1') => Some(ConflictAction::KeepNewer),
+                KeyCode::Char('2') => Some(ConflictAction::KeepOlder),
+                KeyCode::Char('3') => Some(ConflictAction::KeepSource),
+                KeyCode::Char('4') => Some(ConflictAction::KeepDestination),
+                KeyCode::Char('5') => Some(ConflictAction::KeepBoth),
+                KeyCode::Char('6') => Some(ConflictAction::Skip),
+                _ => None,
+            };
+            let Some(action) = action else {
+                return;
+            };
+            if prompt.conflict.kind == ConflictKind::TypeMismatch
+                && !matches!(
+                    action,
+                    ConflictAction::KeepDestination
+                        | ConflictAction::KeepBoth
+                        | ConflictAction::Skip
+                )
+            {
+                app.notice =
+                    Some("Type conflicts allow 4 Keep destination, 5 Keep both, or 6 Skip".into());
+                return;
+            }
+            if operations
+                .resolve_conflict(prompt.conflict.job, action, prompt.apply_to_all)
+                .is_err()
+            {
+                app.notice = Some("Could not submit conflict choice".into());
             }
         }
         OperationView::Finished(report) => {
@@ -746,12 +808,13 @@ fn handle_text_prompt(app: &mut AppState, operations: &OperationEngine, key: Key
 }
 
 fn submit_transfer(app: &mut AppState, operations: &OperationEngine, kind: OperationKind) {
-    let sources = app.operation_sources();
+    let source_pane = app.transfer_source_pane();
+    let sources = app.transfer_sources();
     if sources.is_empty() {
         app.notice = Some("Select or focus a file or directory first".into());
         return;
     }
-    let destination_pane = app.pane(app.active_pane.other());
+    let destination_pane = app.pane(source_pane.other());
     if destination_pane.browsing_drives || !matches!(destination_pane.load_state, LoadState::Ready)
     {
         app.notice = Some("Open a destination directory in the other pane first".into());
@@ -762,10 +825,12 @@ fn submit_transfer(app: &mut AppState, operations: &OperationEngine, kind: Opera
         OperationKind::Copy => OperationIntent::Copy {
             sources,
             destination,
+            verification: app.transfer_verification,
         },
         OperationKind::Move => OperationIntent::Move {
             sources,
             destination,
+            verification: app.transfer_verification,
         },
         _ => return,
     };
@@ -1754,6 +1819,7 @@ mod preview_tests {
             recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: Vec::new(),
+            verification: None,
         });
 
         for character in "del".chars() {
