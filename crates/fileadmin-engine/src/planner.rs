@@ -731,6 +731,18 @@ mod tests {
         assert_eq!(result, vec![PathBuf::from("a"), PathBuf::from("b")]);
     }
 
+    #[test]
+    fn cancelled_planning_stops_before_filesystem_access() {
+        let cancelled = AtomicBool::new(true);
+        let intent = OperationIntent::Copy {
+            sources: vec![PathBuf::from("missing-source")],
+            destination: PathBuf::from("missing-destination"),
+        };
+
+        let error = build_plan(JobId(1), intent, &cancelled).unwrap_err();
+        assert_eq!(error, "Planning cancelled; no files changed");
+    }
+
     #[cfg(windows)]
     #[test]
     fn rejects_reserved_windows_names() {

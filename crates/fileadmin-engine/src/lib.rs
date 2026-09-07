@@ -142,6 +142,14 @@ fn coordinator(
                 let kind = intent.kind();
                 let _ = events.send(OperationEvent::Planning { job, kind });
                 match planner::build_plan(job, intent, &cancel_requested) {
+                    Ok(_) if cancel_requested.load(Ordering::Acquire) => {
+                        let _ = events.send(OperationEvent::Failed {
+                            job: Some(job),
+                            kind,
+                            message: "Planning cancelled; no files changed".into(),
+                        });
+                        busy.store(false, Ordering::Release);
+                    }
                     Ok(plan) => {
                         let _ = events.send(OperationEvent::PlanReady(plan.summary.clone()));
                         pending = Some(plan);
