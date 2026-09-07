@@ -87,6 +87,8 @@ next byte window, while `G` and `Shift+G` load the first or last window.
 The all-drives view groups the detected user folder, saved Favorites, and
 available drives into separate sections. Favorites persist in FileAdmin's user
 configuration directory and can be opened or removed from the `Ctrl+F` panel.
+Both browser panes start in this all-drives view instead of inheriting the
+folder from which FileAdmin was launched.
 
 ## Validate
 

@@ -133,6 +133,10 @@ Focus must always be visible. Selection and focus are different concepts: a row
 can be focused without being selected, and selected rows remain marked when
 focus moves elsewhere.
 
+Both browser panes initially show All drives, giving every launch the same
+orientation regardless of the shell's working directory. Opening the User
+folder, a Favorite, or a drive changes only the active pane.
+
 Modal overlays are reserved for decisions that block safe progress: action
 review, conflicts, authentication/permission escalation handoff, and irreversible
 confirmation. Routine feedback belongs in the main layout or a short-lived
