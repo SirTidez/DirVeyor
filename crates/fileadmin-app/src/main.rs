@@ -7,15 +7,16 @@ use crossterm::terminal::{
 };
 use fileadmin_domain::{
     AppState, EntryKind, FolderSizeProgress, FolderSizeState, LoadState, PaneId, PreviewMatch,
-    PreviewMode, PreviewRegion, PreviewSearchMode, PreviewSession, PreviewState, parent_or_same,
+    PreviewMode, PreviewRegion, PreviewSearchMode, PreviewSession, PreviewState,
+    PreviewWindowDirection, parent_or_same,
 };
 use fileadmin_domain::{
     JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
 use fileadmin_fs::{
-    DirectoryScanner, FolderSizeScanner, FolderSizeUpdate, PreviewLoader, RequestError,
-    ScanLocation, ScanRequest,
+    DirectoryScanner, FolderSizeScanner, FolderSizeUpdate, PreviewLoader, PreviewWindowTarget,
+    RequestError, ScanLocation, ScanRequest,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -66,6 +67,7 @@ fn run(
         drain_operation_events(app, scanner, operations);
         drain_folder_size_events(app, folder_sizes);
         drain_preview_events(app, previews);
+        drain_preview_change_events(app, previews);
         sync_folder_size(app, folder_sizes);
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -587,6 +589,7 @@ fn begin_preview(app: &mut AppState, previews: &PreviewLoader) {
 }
 
 fn begin_preview_path(app: &mut AppState, previews: &PreviewLoader, path: PathBuf) {
+    previews.clear_watch();
     let request_id = previews.request(path.clone());
     app.preview = PreviewState::Loading { request_id, path };
 }
@@ -597,13 +600,42 @@ fn drain_preview_events(app: &mut AppState, previews: &PreviewLoader) {
             &app.preview,
             PreviewState::Loading { request_id, path }
                 if *request_id == event.request_id && *path == event.path
+        ) || matches!(
+            &app.preview,
+            PreviewState::LoadingWindow { request_id, path, .. }
+                if *request_id == event.request_id && *path == event.path
         );
         if !current {
             continue;
         }
-        app.preview = match event.result {
-            Ok(document) => PreviewState::Ready(Box::new(PreviewSession::new(document))),
-            Err(message) => PreviewState::Failed {
+        let previous = std::mem::replace(&mut app.preview, PreviewState::Closed);
+        app.preview = match (previous, event.result) {
+            (
+                PreviewState::LoadingWindow {
+                    direction, session, ..
+                },
+                Ok(document),
+            ) => {
+                previews.watch(&document);
+                PreviewState::Ready(Box::new(session_for_new_window(
+                    *session, document, direction,
+                )))
+            }
+            (PreviewState::LoadingWindow { mut session, .. }, Err(message)) => {
+                if message.starts_with("File changed on disk") {
+                    session.source_changed = true;
+                    session.notice = Some(message);
+                } else {
+                    previews.watch(&session.document);
+                    session.notice = Some(format!("Could not load adjacent window — {message}"));
+                }
+                PreviewState::Ready(session)
+            }
+            (_, Ok(document)) => {
+                previews.watch(&document);
+                PreviewState::Ready(Box::new(PreviewSession::new(document)))
+            }
+            (_, Err(message)) => PreviewState::Failed {
                 request_id: event.request_id,
                 path: event.path,
                 message,
@@ -612,7 +644,127 @@ fn drain_preview_events(app: &mut AppState, previews: &PreviewLoader) {
     }
 }
 
+fn drain_preview_change_events(app: &mut AppState, previews: &PreviewLoader) {
+    while let Ok(event) = previews.try_recv_change() {
+        match &mut app.preview {
+            PreviewState::Ready(session) | PreviewState::LoadingWindow { session, .. }
+                if session.document.path == event.path =>
+            {
+                session.source_changed = true;
+                session.notice = Some("File changed on disk · r Reload".into());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn session_for_new_window(
+    previous: PreviewSession,
+    document: fileadmin_domain::PreviewDocument,
+    direction: PreviewWindowDirection,
+) -> PreviewSession {
+    let mut session = PreviewSession::new(document);
+    session.wrap = previous.wrap;
+    session.horizontal_scroll = previous.horizontal_scroll;
+    session.search.query = previous.search.query;
+    session.search.mode = previous.search.mode;
+    session.search.case_sensitive = previous.search.case_sensitive;
+    session.raw_scroll = if matches!(
+        direction,
+        PreviewWindowDirection::Previous | PreviewWindowDirection::Last
+    ) {
+        session.document.raw_lines.len().saturating_sub(20)
+    } else {
+        0
+    };
+    recompute_preview_search(&mut session);
+    session
+}
+
+fn begin_preview_window(
+    app: &mut AppState,
+    previews: &PreviewLoader,
+    direction: PreviewWindowDirection,
+) {
+    let previous = std::mem::replace(&mut app.preview, PreviewState::Closed);
+    let PreviewState::Ready(mut session) = previous else {
+        app.preview = previous;
+        return;
+    };
+    let target = match direction {
+        PreviewWindowDirection::Previous => {
+            PreviewWindowTarget::EndingAt(session.document.window_start)
+        }
+        PreviewWindowDirection::Next => {
+            PreviewWindowTarget::StartingAt(session.document.window_end)
+        }
+        PreviewWindowDirection::First => PreviewWindowTarget::StartingAt(0),
+        PreviewWindowDirection::Last => PreviewWindowTarget::EndingAt(session.document.file_size),
+    };
+    let path = session.document.path.clone();
+    session.notice = Some(
+        match direction {
+            PreviewWindowDirection::Previous => "Loading previous window…",
+            PreviewWindowDirection::Next => "Loading next window…",
+            PreviewWindowDirection::First => "Loading first window…",
+            PreviewWindowDirection::Last => "Loading last window…",
+        }
+        .into(),
+    );
+    previews.clear_watch();
+    let request_id = previews.request_window(&session.document, target);
+    app.preview = PreviewState::LoadingWindow {
+        request_id,
+        path,
+        direction,
+        session,
+    };
+}
+
+fn preview_window_command(
+    session: &PreviewSession,
+    key: KeyEvent,
+) -> Option<PreviewWindowDirection> {
+    if session.help_visible || session.search.editing {
+        return None;
+    }
+    let scroll = if session.mode == PreviewMode::Raw || session.active_region == PreviewRegion::Raw
+    {
+        session.raw_scroll
+    } else {
+        session.formatted_scroll
+    };
+    let last = session.active_line_count().saturating_sub(1);
+    match key.code {
+        KeyCode::Char('[') if session.has_previous_window() => {
+            Some(PreviewWindowDirection::Previous)
+        }
+        KeyCode::Char(']') if session.has_next_window() => Some(PreviewWindowDirection::Next),
+        KeyCode::Up | KeyCode::Char('k') if scroll == 0 && session.has_previous_window() => {
+            Some(PreviewWindowDirection::Previous)
+        }
+        KeyCode::Down | KeyCode::Char('j') if scroll >= last && session.has_next_window() => {
+            Some(PreviewWindowDirection::Next)
+        }
+        KeyCode::PageUp if scroll == 0 && session.has_previous_window() => {
+            Some(PreviewWindowDirection::Previous)
+        }
+        KeyCode::PageDown if scroll.saturating_add(20) >= last && session.has_next_window() => {
+            Some(PreviewWindowDirection::Next)
+        }
+        KeyCode::Char('g') if session.has_previous_window() => Some(PreviewWindowDirection::First),
+        KeyCode::Char('G') if session.has_next_window() => Some(PreviewWindowDirection::Last),
+        _ => None,
+    }
+}
+
 fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEvent) {
+    if let PreviewState::Ready(session) = &app.preview
+        && let Some(direction) = preview_window_command(session, key)
+    {
+        begin_preview_window(app, previews, direction);
+        return;
+    }
     match &mut app.preview {
         PreviewState::Closed => {}
         PreviewState::Loading { .. } => {
@@ -621,8 +773,17 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 app.preview = PreviewState::Closed;
             }
         }
+        PreviewState::LoadingWindow { .. } => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                previews.cancel();
+                app.preview = PreviewState::Closed;
+            }
+        }
         PreviewState::Failed { path, .. } => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => app.preview = PreviewState::Closed,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                previews.cancel();
+                app.preview = PreviewState::Closed;
+            }
             KeyCode::Char('r') => {
                 let path = path.clone();
                 let request_id = previews.request(path.clone());
@@ -645,7 +806,10 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 return;
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => app.preview = PreviewState::Closed,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    previews.cancel();
+                    app.preview = PreviewState::Closed;
+                }
                 KeyCode::Char('/') => {
                     session.search.editing = true;
                     recompute_preview_search(session);
@@ -666,7 +830,7 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 KeyCode::PageDown => scroll_preview(session, 20),
                 KeyCode::Home | KeyCode::Char('g') => *session.active_scroll_mut() = 0,
                 KeyCode::End | KeyCode::Char('G') => {
-                    let last = session.active_lines().len().saturating_sub(1);
+                    let last = session.active_line_count().saturating_sub(1);
                     *session.active_scroll_mut() = last;
                 }
                 KeyCode::Left if !session.wrap => {
@@ -691,6 +855,7 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 KeyCode::Char('v') => cycle_preview_mode(session),
                 KeyCode::Char('r') => {
                     let path = session.document.path.clone();
+                    previews.clear_watch();
                     let request_id = previews.request(path.clone());
                     app.preview = PreviewState::Loading { request_id, path };
                 }
@@ -775,7 +940,7 @@ fn cycle_preview_mode(session: &mut PreviewSession) {
 }
 
 fn scroll_preview(session: &mut PreviewSession, delta: isize) {
-    let last = session.active_lines().len().saturating_sub(1);
+    let last = session.active_line_count().saturating_sub(1);
     let scroll = session.active_scroll_mut();
     *scroll = scroll.saturating_add_signed(delta).min(last);
 }
@@ -993,6 +1158,8 @@ mod preview_tests {
             kind: PreviewKind::Log,
             encoding: PreviewEncoding::Utf8,
             completeness: PreviewCompleteness::Complete,
+            window_start: 0,
+            window_end: 20,
             raw_lines: lines.iter().map(|line| (*line).to_owned()).collect(),
             formatted_lines: None,
             format_error: None,
@@ -1091,5 +1258,62 @@ mod preview_tests {
 
         assert_eq!(session.search.current, Some(1));
         assert_eq!(session.notice.as_deref(), Some("Wrapped to end"));
+    }
+
+    #[test]
+    fn preview_edges_request_adjacent_and_file_end_windows() {
+        let mut session = session(&["first", "second"]);
+        session.document.file_size = 4 * 1024 * 1024;
+        session.document.window_start = 1024 * 1024;
+        session.document.window_end = 2 * 1024 * 1024;
+        session.document.completeness = PreviewCompleteness::MiddleWindow;
+
+        assert_eq!(
+            preview_window_command(&session, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(PreviewWindowDirection::Previous)
+        );
+        assert_eq!(
+            preview_window_command(
+                &session,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
+            ),
+            Some(PreviewWindowDirection::First)
+        );
+
+        session.raw_scroll = 1;
+        assert_eq!(
+            preview_window_command(&session, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(PreviewWindowDirection::Next)
+        );
+        assert_eq!(
+            preview_window_command(
+                &session,
+                KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)
+            ),
+            Some(PreviewWindowDirection::Last)
+        );
+    }
+
+    #[test]
+    fn loading_a_new_window_preserves_find_preferences() {
+        let mut previous = session(&["old"]);
+        previous.search.query = "needle".into();
+        previous.search.mode = PreviewSearchMode::Regex;
+        previous.search.case_sensitive = true;
+        previous.wrap = true;
+        let mut document = previous.document.clone();
+        document.window_start = 1024;
+        document.window_end = 2048;
+        document.file_size = 4096;
+        document.completeness = PreviewCompleteness::MiddleWindow;
+        document.raw_lines = vec!["needle".into()];
+
+        let loaded = session_for_new_window(previous, document, PreviewWindowDirection::Next);
+
+        assert_eq!(loaded.search.query, "needle");
+        assert_eq!(loaded.search.mode, PreviewSearchMode::Regex);
+        assert!(loaded.search.case_sensitive);
+        assert!(loaded.wrap);
+        assert_eq!(loaded.search.matches.len(), 1);
     }
 }

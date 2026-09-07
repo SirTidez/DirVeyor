@@ -4,7 +4,7 @@ mod folder_size;
 mod preview;
 
 pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner, FolderSizeUpdate};
-pub use preview::{PreviewEvent, PreviewLoader};
+pub use preview::{PreviewChangeEvent, PreviewEvent, PreviewLoader, PreviewWindowTarget};
 
 use fileadmin_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
 use std::fs;

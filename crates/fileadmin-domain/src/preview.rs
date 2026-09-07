@@ -47,6 +47,7 @@ impl PreviewEncoding {
 pub enum PreviewCompleteness {
     Complete,
     HeadWindow,
+    MiddleWindow,
     TailWindow,
 }
 
@@ -55,6 +56,7 @@ impl PreviewCompleteness {
         match self {
             Self::Complete => "Complete file",
             Self::HeadWindow => "Head window",
+            Self::MiddleWindow => "Middle window",
             Self::TailWindow => "Tail window",
         }
     }
@@ -89,6 +91,8 @@ pub struct PreviewDocument {
     pub kind: PreviewKind,
     pub encoding: PreviewEncoding,
     pub completeness: PreviewCompleteness,
+    pub window_start: u64,
+    pub window_end: u64,
     pub raw_lines: Vec<String>,
     pub formatted_lines: Option<Vec<PreviewLine>>,
     pub format_error: Option<String>,
@@ -177,6 +181,7 @@ pub struct PreviewSession {
     pub search: PreviewSearch,
     pub notice: Option<String>,
     pub help_visible: bool,
+    pub source_changed: bool,
 }
 
 impl PreviewSession {
@@ -198,7 +203,16 @@ impl PreviewSession {
             search: PreviewSearch::default(),
             notice: None,
             help_visible: false,
+            source_changed: false,
         }
+    }
+
+    pub const fn has_previous_window(&self) -> bool {
+        self.document.window_start > 0
+    }
+
+    pub const fn has_next_window(&self) -> bool {
+        self.document.window_end < self.document.file_size
     }
 
     pub fn active_lines(&self) -> Vec<&str> {
@@ -210,6 +224,17 @@ impl PreviewSession {
                 .as_ref()
                 .map(|lines| lines.iter().map(|line| line.text.as_str()).collect())
                 .unwrap_or_else(|| self.document.raw_lines.iter().map(String::as_str).collect())
+        }
+    }
+
+    pub fn active_line_count(&self) -> usize {
+        if self.mode == PreviewMode::Raw || self.active_region == PreviewRegion::Raw {
+            self.document.raw_lines.len()
+        } else {
+            self.document
+                .formatted_lines
+                .as_ref()
+                .map_or(self.document.raw_lines.len(), Vec::len)
         }
     }
 
@@ -230,11 +255,25 @@ pub enum PreviewState {
         path: PathBuf,
     },
     Ready(Box<PreviewSession>),
+    LoadingWindow {
+        request_id: u64,
+        path: PathBuf,
+        direction: PreviewWindowDirection,
+        session: Box<PreviewSession>,
+    },
     Failed {
         request_id: u64,
         path: PathBuf,
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewWindowDirection {
+    Previous,
+    Next,
+    First,
+    Last,
 }
 
 impl PreviewState {
@@ -257,6 +296,8 @@ mod tests {
             kind: PreviewKind::Markdown,
             encoding: PreviewEncoding::Utf8,
             completeness: PreviewCompleteness::Complete,
+            window_start: 0,
+            window_end: 4,
             raw_lines: vec!["# Hi".into()],
             formatted_lines: Some(vec![PreviewLine {
                 text: "Hi".into(),

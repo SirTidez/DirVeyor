@@ -132,7 +132,9 @@ fn render_preview(frame: &mut Frame, area: Rect, preview: &PreviewState) {
                 area,
             );
         }
-        PreviewState::Ready(session) => render_preview_session(frame, area, session),
+        PreviewState::Ready(session) | PreviewState::LoadingWindow { session, .. } => {
+            render_preview_session(frame, area, session)
+        }
     }
 }
 
@@ -150,13 +152,23 @@ fn render_preview_session(frame: &mut Frame, area: Rect, session: &PreviewSessio
         .file_name()
         .map(|name| safe_text(&name.to_string_lossy()))
         .unwrap_or_else(|| safe_text(&document.path.to_string_lossy()));
+    let window = if document.completeness.is_complete() {
+        String::new()
+    } else {
+        format!(
+            " · bytes {}–{}",
+            document.window_start.saturating_add(1),
+            document.window_end
+        )
+    };
     let header_text = format!(
-        " Preview · {name} · {} · {} · {} · {} · {} ",
+        " Preview · {name} · {} · {} · {} · {} · {}{} ",
         document.kind.label(),
         session.mode.label(document.kind),
         document.encoding.label(),
         human_size(document.file_size),
-        document.completeness.label()
+        document.completeness.label(),
+        window
     );
     frame.render_widget(
         Paragraph::new(truncate(&header_text, header.width as usize)).style(
@@ -384,6 +396,9 @@ fn preview_status(session: &PreviewSession) -> String {
             session.search.mode.label()
         );
     }
+    if session.source_changed {
+        return "File changed on disk · r Reload".into();
+    }
     if let Some(error) = &session.search.error {
         return safe_text(error);
     }
@@ -411,7 +426,18 @@ fn preview_status(session: &PreviewSession) -> String {
         .notice
         .clone()
         .or_else(|| session.document.format_error.clone())
-        .unwrap_or_else(|| safe_text(&session.document.path.to_string_lossy()))
+        .unwrap_or_else(|| {
+            if session.document.completeness.is_complete() {
+                safe_text(&session.document.path.to_string_lossy())
+            } else {
+                format!(
+                    "Loaded bytes {}–{} of {} · [/] Previous/next window",
+                    session.document.window_start.saturating_add(1),
+                    session.document.window_end,
+                    session.document.file_size
+                )
+            }
+        })
 }
 
 fn preview_footer(session: &PreviewSession) -> String {
@@ -423,12 +449,12 @@ fn preview_footer(session: &PreviewSession) -> String {
         _ => "",
     };
     format!(
-        " Esc/q Back  ↑↓ Scroll  PgUp/PgDn  {modes}/ Find  n/N Match  w Wrap  r Reload  F1 Help"
+        " Esc/q Back  ↑↓ Scroll  PgUp/PgDn  [/] Window  g/G First/Last  {modes}/ Find  n/N Match  r Reload"
     )
 }
 
 fn render_preview_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(76, 76, area);
+    let popup = centered_rect(76, 88, area);
     let lines = vec![
         Line::styled(
             "Full-screen Preview controls",
@@ -440,7 +466,9 @@ fn render_preview_help(frame: &mut Frame, area: Rect) {
         Line::raw("Esc / q            Return to Browse"),
         Line::raw("↑ ↓ / j k          Scroll"),
         Line::raw("PageUp / PageDown  Scroll by page"),
-        Line::raw("Home/End / g/G     Start/end"),
+        Line::raw("Home / End          Start/end of loaded window"),
+        Line::raw("[ / ]               Previous / next file window"),
+        Line::raw("g / G               First / last file window"),
         Line::raw("← →                 Horizontal scroll"),
         Line::raw("w                   Toggle wrapping"),
         Line::raw("1 / 2 / 3           Raw / Split / Preview"),
@@ -1718,6 +1746,8 @@ mod tests {
                 kind: fileadmin_domain::PreviewKind::Log,
                 encoding: fileadmin_domain::PreviewEncoding::Utf8,
                 completeness: fileadmin_domain::PreviewCompleteness::Complete,
+                window_start: 0,
+                window_end: 18,
                 raw_lines: vec!["INFO ready".into(), "ERROR stopped".into()],
                 formatted_lines: None,
                 format_error: None,
@@ -1742,6 +1772,8 @@ mod tests {
             kind: fileadmin_domain::PreviewKind::Markdown,
             encoding: fileadmin_domain::PreviewEncoding::Utf8,
             completeness: fileadmin_domain::PreviewCompleteness::Complete,
+            window_start: 0,
+            window_end: 12,
             raw_lines: vec!["# Heading".into()],
             formatted_lines: Some(vec![PreviewLine {
                 text: "Heading".into(),
@@ -1758,5 +1790,33 @@ mod tests {
         assert!(screen.contains("Rendered"));
         assert!(screen.contains("# Heading"));
         assert!(screen.contains("Heading"));
+    }
+
+    #[test]
+    fn windowed_preview_shows_byte_range_and_changed_notice() {
+        let mut app = populated_app();
+        let document = fileadmin_domain::PreviewDocument {
+            request_id: 3,
+            path: PathBuf::from("large.log"),
+            file_size: 4 * 1024 * 1024,
+            modified: None,
+            kind: fileadmin_domain::PreviewKind::Log,
+            encoding: fileadmin_domain::PreviewEncoding::Utf8,
+            completeness: fileadmin_domain::PreviewCompleteness::MiddleWindow,
+            window_start: 1024 * 1024,
+            window_end: 2 * 1024 * 1024,
+            raw_lines: vec!["middle".into()],
+            formatted_lines: None,
+            format_error: None,
+        };
+        let mut session = PreviewSession::new(document);
+        app.preview = PreviewState::Ready(Box::new(session.clone()));
+        let screen = rendered_screen(&app, 160, 30);
+        assert!(screen.contains("Middle window · bytes 1048577–2097152"));
+
+        session.source_changed = true;
+        app.preview = PreviewState::Ready(Box::new(session));
+        let screen = rendered_screen(&app, 160, 30);
+        assert!(screen.contains("File changed on disk · r Reload"));
     }
 }

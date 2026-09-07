@@ -7,15 +7,17 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 const RICH_PREVIEW_LIMIT: u64 = 8 * 1024 * 1024;
 const TEXT_WINDOW_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIEW_LINES: usize = 100_000;
 const MAX_FORMATTED_BYTES: usize = 16 * 1024 * 1024;
 const RESULT_CAPACITY: usize = 2;
+const CHANGE_CHECK_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Debug)]
 pub struct PreviewEvent {
@@ -24,10 +26,31 @@ pub struct PreviewEvent {
     pub result: Result<PreviewDocument, String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewChangeEvent {
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreviewWatch {
+    path: PathBuf,
+    file_size: u64,
+    modified: Option<SystemTime>,
+}
+
 #[derive(Clone, Debug)]
 struct PreviewRequest {
     request_id: u64,
     path: PathBuf,
+    target: PreviewWindowTarget,
+    expected_identity: Option<(u64, Option<SystemTime>)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewWindowTarget {
+    Initial,
+    StartingAt(u64),
+    EndingAt(u64),
 }
 
 pub struct PreviewLoader {
@@ -35,6 +58,8 @@ pub struct PreviewLoader {
     results: Receiver<PreviewEvent>,
     current_request: Arc<AtomicU64>,
     next_request: AtomicU64,
+    watch: Arc<(Mutex<Option<PreviewWatch>>, Condvar)>,
+    changes: Receiver<PreviewChangeEvent>,
 }
 
 impl PreviewLoader {
@@ -48,22 +73,52 @@ impl PreviewLoader {
             .name("fileadmin-preview".into())
             .spawn(move || preview_worker(worker_pending, result_tx, worker_current))
             .expect("failed to start preview reader");
+        let watch = Arc::new((Mutex::new(None), Condvar::new()));
+        let worker_watch = Arc::clone(&watch);
+        let (change_tx, change_rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("fileadmin-preview-watch".into())
+            .spawn(move || preview_watch_worker(worker_watch, change_tx))
+            .expect("failed to start preview change watcher");
         Self {
             pending,
             results: result_rx,
             current_request,
             next_request: AtomicU64::new(1),
+            watch,
+            changes: change_rx,
         }
     }
 
     pub fn request(&self, path: PathBuf) -> u64 {
+        self.enqueue(path, PreviewWindowTarget::Initial, None)
+    }
+
+    pub fn request_window(&self, document: &PreviewDocument, target: PreviewWindowTarget) -> u64 {
+        self.enqueue(
+            document.path.clone(),
+            target,
+            Some((document.file_size, document.modified)),
+        )
+    }
+
+    fn enqueue(
+        &self,
+        path: PathBuf,
+        target: PreviewWindowTarget,
+        expected_identity: Option<(u64, Option<SystemTime>)>,
+    ) -> u64 {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         self.current_request.store(request_id, Ordering::Release);
         let (pending, ready) = &*self.pending;
         *pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(PreviewRequest { request_id, path });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PreviewRequest {
+            request_id,
+            path,
+            target,
+            expected_identity,
+        });
         ready.notify_one();
         request_id
     }
@@ -75,10 +130,35 @@ impl PreviewLoader {
         *pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.clear_watch();
     }
 
     pub fn try_recv(&self) -> Result<PreviewEvent, TryRecvError> {
         self.results.try_recv()
+    }
+
+    pub fn watch(&self, document: &PreviewDocument) {
+        let (watch, changed) = &*self.watch;
+        *watch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PreviewWatch {
+            path: document.path.clone(),
+            file_size: document.file_size,
+            modified: document.modified,
+        });
+        changed.notify_one();
+    }
+
+    pub fn clear_watch(&self) {
+        let (watch, changed) = &*self.watch;
+        *watch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        changed.notify_one();
+    }
+
+    pub fn try_recv_change(&self) -> Result<PreviewChangeEvent, TryRecvError> {
+        self.changes.try_recv()
     }
 }
 
@@ -123,6 +203,50 @@ fn preview_worker(
     }
 }
 
+fn preview_watch_worker(
+    watch: Arc<(Mutex<Option<PreviewWatch>>, Condvar)>,
+    changes: SyncSender<PreviewChangeEvent>,
+) {
+    loop {
+        let current = {
+            let (watch, changed) = &*watch;
+            let mut slot = watch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while slot.is_none() {
+                slot = changed
+                    .wait(slot)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            let (slot_after_wait, _) = changed
+                .wait_timeout(slot, CHANGE_CHECK_INTERVAL)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(current) = slot_after_wait.clone() else {
+                continue;
+            };
+            current
+        };
+        let changed_on_disk = fs::metadata(&current.path).map_or(true, |metadata| {
+            metadata.len() != current.file_size || metadata.modified().ok() != current.modified
+        });
+        if !changed_on_disk {
+            continue;
+        }
+        let (slot, _) = &*watch;
+        let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let is_current = slot.as_ref().is_some_and(|watched| *watched == current);
+        if !is_current {
+            continue;
+        }
+        *slot = None;
+        drop(slot);
+        match changes.try_send(PreviewChangeEvent { path: current.path }) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
+
 fn load_preview(
     request: &PreviewRequest,
     current_request: &AtomicU64,
@@ -135,6 +259,11 @@ fn load_preview(
     if !metadata.is_file() || metadata.file_type().is_symlink() || is_windows_reparse(&metadata) {
         return Err("Preview supports ordinary files only".into());
     }
+    if let Some((expected_size, expected_modified)) = request.expected_identity
+        && (metadata.len() != expected_size || metadata.modified().ok() != expected_modified)
+    {
+        return Err("File changed on disk · r Reload".into());
+    }
     let kind = classify_path(&request.path)?;
     let file_size = metadata.len();
     let mut file =
@@ -145,17 +274,15 @@ fn load_preview(
     let encoding = detect_encoding(&sample)?;
 
     let complete = file_size <= RICH_PREVIEW_LIMIT;
-    let tail = !complete && kind == PreviewKind::Log;
-    let start = if tail {
-        file_size.saturating_sub(TEXT_WINDOW_BYTES)
-    } else {
-        0
-    };
-    let length = if complete {
-        file_size
-    } else {
-        TEXT_WINDOW_BYTES.min(file_size.saturating_sub(start))
-    };
+    let (start, end) = select_window(
+        &mut file,
+        file_size,
+        encoding,
+        kind,
+        request.target,
+        complete,
+    )?;
+    let length = end.saturating_sub(start);
     file.seek(SeekFrom::Start(start))
         .map_err(|error| format!("Could not seek file — {error}"))?;
     let mut bytes = vec![0; length as usize];
@@ -166,21 +293,17 @@ fn load_preview(
     }
     let (text, encoding) = decode_text(&bytes, encoding, start == 0)?;
     let text = sanitize_text(&text);
-    let text = if tail {
-        text.split_once('\n')
-            .map(|(_, remainder)| remainder.to_owned())
-            .unwrap_or(text)
-    } else {
-        text
-    };
     let line_truncated = text.split('\n').nth(MAX_PREVIEW_LINES).is_some();
+    let tail = end == file_size && start > 0;
     let raw_lines = split_lines(&text, tail);
     let completeness = if complete && !line_truncated {
         PreviewCompleteness::Complete
-    } else if tail {
+    } else if start == 0 {
+        PreviewCompleteness::HeadWindow
+    } else if end == file_size {
         PreviewCompleteness::TailWindow
     } else {
-        PreviewCompleteness::HeadWindow
+        PreviewCompleteness::MiddleWindow
     };
 
     let (formatted_lines, format_error) = if complete && !line_truncated {
@@ -213,10 +336,86 @@ fn load_preview(
         kind,
         encoding,
         completeness,
+        window_start: start,
+        window_end: end,
         raw_lines,
         formatted_lines,
         format_error,
     })
+}
+
+fn select_window(
+    file: &mut File,
+    file_size: u64,
+    encoding: PreviewEncoding,
+    kind: PreviewKind,
+    target: PreviewWindowTarget,
+    complete: bool,
+) -> Result<(u64, u64), String> {
+    if complete {
+        return Ok((0, file_size));
+    }
+    let target = match target {
+        PreviewWindowTarget::Initial if kind == PreviewKind::Log => {
+            PreviewWindowTarget::EndingAt(file_size)
+        }
+        PreviewWindowTarget::Initial => PreviewWindowTarget::StartingAt(0),
+        target => target,
+    };
+    let (nominal_start, nominal_end) = match target {
+        PreviewWindowTarget::Initial => unreachable!("initial target was resolved above"),
+        PreviewWindowTarget::StartingAt(start) => {
+            let start = start.min(file_size);
+            (
+                start,
+                start.saturating_add(TEXT_WINDOW_BYTES).min(file_size),
+            )
+        }
+        PreviewWindowTarget::EndingAt(end) => {
+            let end = end.min(file_size);
+            (end.saturating_sub(TEXT_WINDOW_BYTES), end)
+        }
+    };
+    let start = align_boundary(file, nominal_start, file_size, encoding)?;
+    let end = align_boundary(file, nominal_end, file_size, encoding)?;
+    if start >= end && start < file_size {
+        return Ok((
+            start,
+            file_size.min(start.saturating_add(TEXT_WINDOW_BYTES)),
+        ));
+    }
+    Ok((start, end))
+}
+
+fn align_boundary(
+    file: &mut File,
+    offset: u64,
+    file_size: u64,
+    encoding: PreviewEncoding,
+) -> Result<u64, String> {
+    let offset = offset.min(file_size);
+    if offset == 0 || offset == file_size {
+        return Ok(offset);
+    }
+    if matches!(
+        encoding,
+        PreviewEncoding::Utf16Le | PreviewEncoding::Utf16Be
+    ) {
+        return Ok(offset - (offset % 2));
+    }
+    let probe_start = offset.saturating_sub(3);
+    let mut probe = [0_u8; 4];
+    file.seek(SeekFrom::Start(probe_start))
+        .map_err(|error| format!("Could not seek file boundary — {error}"))?;
+    let count = file
+        .read(&mut probe)
+        .map_err(|error| format!("Could not inspect file boundary — {error}"))?;
+    let relative = (offset - probe_start) as usize;
+    let mut boundary = relative.min(count);
+    while boundary > 0 && boundary < count && probe[boundary] & 0b1100_0000 == 0b1000_0000 {
+        boundary -= 1;
+    }
+    Ok(probe_start + boundary as u64)
 }
 
 fn classify_path(path: &Path) -> Result<PreviewKind, String> {
@@ -377,7 +576,11 @@ fn decode_text(
                 .map_err(|_| "The UTF-16 file contains invalid text".into())
         }
         PreviewEncoding::Utf8 => {
-            let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+            let bytes = if starts_at_file_beginning {
+                bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)
+            } else {
+                bytes
+            };
             match String::from_utf8(bytes.to_vec()) {
                 Ok(text) => Ok((text, PreviewEncoding::Utf8)),
                 Err(error) => Ok((
@@ -624,6 +827,8 @@ mod tests {
         let request = PreviewRequest {
             request_id: 5,
             path,
+            target: PreviewWindowTarget::Initial,
+            expected_identity: None,
         };
         let current = AtomicU64::new(5);
 
@@ -648,6 +853,8 @@ mod tests {
         let request = PreviewRequest {
             request_id: 6,
             path,
+            target: PreviewWindowTarget::Initial,
+            expected_identity: None,
         };
         let current = AtomicU64::new(6);
 
@@ -656,5 +863,127 @@ mod tests {
         assert_eq!(document.completeness, PreviewCompleteness::TailWindow);
         assert!(document.raw_lines.iter().any(|line| line == "TAIL marker"));
         assert!(document.raw_lines.len() < 10);
+
+        let middle = PreviewRequest {
+            request_id: 6,
+            path: document.path.clone(),
+            target: PreviewWindowTarget::StartingAt(TEXT_WINDOW_BYTES),
+            expected_identity: Some((document.file_size, document.modified)),
+        };
+        let middle = load_preview(&middle, &current).unwrap();
+        assert_eq!(middle.completeness, PreviewCompleteness::MiddleWindow);
+        assert_eq!(middle.window_start, TEXT_WINDOW_BYTES);
+        assert_eq!(middle.window_end, TEXT_WINDOW_BYTES * 2);
+    }
+
+    #[test]
+    fn adjacent_utf8_windows_share_a_safe_character_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unicode.txt");
+        let mut bytes = vec![b'a'; TEXT_WINDOW_BYTES as usize - 1];
+        bytes.extend_from_slice("€after".as_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let first = select_window(
+            &mut file,
+            bytes.len() as u64,
+            PreviewEncoding::Utf8,
+            PreviewKind::Text,
+            PreviewWindowTarget::StartingAt(0),
+            false,
+        )
+        .unwrap();
+        let second = select_window(
+            &mut file,
+            bytes.len() as u64,
+            PreviewEncoding::Utf8,
+            PreviewKind::Text,
+            PreviewWindowTarget::StartingAt(first.1),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(first.1, second.0);
+        assert_eq!(first.1, TEXT_WINDOW_BYTES - 1);
+        file.seek(SeekFrom::Start(second.0)).unwrap();
+        let mut second_bytes = vec![0; (second.1 - second.0) as usize];
+        file.read_exact(&mut second_bytes).unwrap();
+        assert!(std::str::from_utf8(&second_bytes).unwrap().starts_with('€'));
+    }
+
+    #[test]
+    fn utf16_windows_are_aligned_to_complete_code_units() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unicode.log");
+        fs::write(&path, vec![0_u8; 64]).unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let window = select_window(
+            &mut file,
+            64,
+            PreviewEncoding::Utf16Le,
+            PreviewKind::Log,
+            PreviewWindowTarget::StartingAt(7),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(window.0, 6);
+        assert_eq!(window.0 % 2, 0);
+        assert_eq!(window.1 % 2, 0);
+    }
+
+    #[test]
+    fn adjacent_window_rejects_a_changed_source_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("changed.log");
+        fs::write(&path, b"current contents").unwrap();
+        let request = PreviewRequest {
+            request_id: 9,
+            path,
+            target: PreviewWindowTarget::StartingAt(0),
+            expected_identity: Some((1, None)),
+        };
+
+        let error = load_preview(&request, &AtomicU64::new(9)).unwrap_err();
+
+        assert_eq!(error, "File changed on disk · r Reload");
+    }
+
+    #[test]
+    fn watcher_reports_a_changed_source_without_reading_its_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("watched.log");
+        fs::write(&path, b"before").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let loader = PreviewLoader::new();
+        loader.watch(&PreviewDocument {
+            request_id: 1,
+            path: path.clone(),
+            file_size: metadata.len(),
+            modified: metadata.modified().ok(),
+            kind: PreviewKind::Log,
+            encoding: PreviewEncoding::Utf8,
+            completeness: PreviewCompleteness::Complete,
+            window_start: 0,
+            window_end: metadata.len(),
+            raw_lines: Vec::new(),
+            formatted_lines: None,
+            format_error: None,
+        });
+        fs::write(&path, b"after with a different length").unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let change = loop {
+            match loader.try_recv_change() {
+                Ok(change) => break change,
+                Err(TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                result => panic!("change event was not received: {result:?}"),
+            }
+        };
+        assert_eq!(change.path, path);
     }
 }
