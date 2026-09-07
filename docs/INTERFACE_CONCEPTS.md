@@ -27,7 +27,7 @@ actions legible at a glance.
 │                                  │ 2 items · 1.9 GB            │
 │                                  │ Space available 238 GB      │
 ├──────────────────────────────────┴─────────────────────────────┤
-│ Tab Switch pane  Space Select  Enter Open  c Copy  m Move      │
+│ ↑↓ Move  ← Back  → Open/select  Enter Open  c Copy  m Move     │
 └────────────────────────────────────────────────────────────────┘
 ```
 

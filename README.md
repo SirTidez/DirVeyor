@@ -52,9 +52,11 @@ Common controls:
 | --- | --- |
 | `Tab` | Switch pane |
 | Arrow keys or `j`/`k` | Move focus |
+| `Right Arrow` | Open the focused directory, or toggle selection for a focused file |
+| `Left Arrow` or `Backspace` | Go to the parent and restore focus to the directory just exited |
 | `Space` | Toggle selection |
 | `Enter` | Open a directory, preview a focused file, or retry a failed scan |
-| `Enter` on `..` or `Backspace` | Go to the parent directory; from a Windows drive root, show all drives |
+| `Enter` on `..` | Go to the parent and restore focus; from a Windows drive root, show all drives |
 | `/` | Filter the active pane |
 | `h` | Toggle dotfiles |
 | `s` | Cycle sort field |
