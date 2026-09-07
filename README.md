@@ -37,7 +37,9 @@ destinations are never overwritten: copy and move conflicts receive numbered
 "Keep both" names, while rename and new-folder conflicts stop safely. Recycle
 uses the operating-system Recycle Bin or Trash and never falls back to permanent
 deletion. Permanent deletion is a separate mode with an additional typed
-confirmation.
+confirmation. Its planning screen scans the full tree without changing it, and
+its review and progress screens report files, folders, and logical bytes instead
+of treating a large directory as one item.
 
 ## User guide
 
@@ -136,13 +138,17 @@ Recycle mode is the default. It uses the operating-system Recycle Bin or Trash
 and never silently falls back to permanent deletion. `Ctrl+D` switches to the
 clearly labeled permanent mode; permanent plans require the user to type
 `DELETE` before Enter can execute them. Permanent deletion cannot be undone,
-and a directory error can occur after some descendants have already been
-removed.
+and a later error can occur after earlier reviewed entries have already been
+removed. While running, FileAdmin shows removed bytes, file count, folder count,
+overall entry count, current path, and a progress bar.
 
-FileAdmin snapshots selected top-level items without reading every directory
-entry before presenting a delete plan. This allows Windows to handle old or
-partially inaccessible directory trees directly. Root paths, links, junctions,
-reparse points, special objects, and overlapping selections remain blocked.
+Permanent deletion scans and freezes the complete readable tree before review,
+then removes reviewed files individually and folders from deepest to shallowest.
+If the scan cannot read part of the tree, planning stops before anything changes
+and may offer conditional elevation for Access Denied. Recycle mode remains an
+operating-system handoff and keeps top-level scope when a platform directory
+cannot be inspected recursively. Root paths, links, junctions, reparse points,
+special objects, and overlapping selections remain blocked.
 
 If Windows returns Access Denied during a delete attempt and FileAdmin is not
 already elevated, the result offers `Ctrl+E`. This requests UAC and opens a new

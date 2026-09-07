@@ -96,8 +96,9 @@ Executable and presentation layer:
 Reviewed operation planner and executor:
 
 - a single bounded coordinator and at most two copy workers;
-- immutable plan summaries with exact copy/move counts or explicitly labeled
-  top-level delete scope, strategy, warnings, and conflict resolutions;
+- immutable plan summaries with exact copy/move/permanent-delete counts or
+  explicitly labeled top-level recycle scope, strategy, warnings, and conflict
+  resolutions;
 - root, overlap, self-descendant, link/reparse, special-file, and plan-size guards;
 - no-overwrite copy publication through temporary files;
 - Windows same-volume native no-replace moves;
@@ -135,13 +136,16 @@ Windows hidden attributes are not yet considered.
 
 1. The UI captures the active pane's selected items, or its focused item when
    nothing is selected. Copy and move take the other open pane as destination.
-2. Copy and move enumerate a frozen manifest. Delete plans snapshot only the
-   selected roots so an inaccessible descendant cannot block the operating
-   system's recycle/delete facility. No mutation occurs during planning.
+2. Copy, move, and permanent delete enumerate a frozen manifest. Planning emits
+   live discovered file, folder, and byte counts without mutation. Recycle keeps
+   selected-root scope so an inaccessible descendant cannot block the operating
+   system's Recycle Bin / Trash facility.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
    Permanent deletion additionally requires typing `DELETE`.
 4. The executor revalidates source identity, performs the planned strategy, and
-   reports bounded progress. Cancellation stops before the next safe step.
+   reports bounded progress. Permanent delete removes manifest files one at a
+   time and directories deepest-first, exposing completed bytes and separate
+   file/folder counts. Cancellation stops before the next safe step.
 5. The UI displays a durable outcome and refreshes affected visible panes.
 
 ## Safety properties already enforced

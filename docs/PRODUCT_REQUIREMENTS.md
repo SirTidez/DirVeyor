@@ -179,9 +179,11 @@ Intent -> Plan -> Scan -> Review if needed -> Queue -> Transfer
   conflicts detectable up front, capacity estimates, and recovery options.
 - **Scan** enumerates enough work to present scope; very large trees may stream
   additional discoveries while clearly showing that totals are still growing.
-- **Delete scan** may snapshot only selected roots and label recursive totals as
-  unknown when enumeration would prevent the platform delete API from handling
-  an otherwise removable directory.
+- **Permanent-delete scan** freezes a complete readable manifest and streams
+  discovered file, folder, and byte counts before review. **Recycle scan** may
+  snapshot only selected roots and label recursive totals as unknown when
+  enumeration would prevent the platform API from handling an otherwise
+  removable directory.
 - **Review** is mandatory for destructive or ambiguous plans.
 - **Transfer** emits monotonic byte and item counters from actual completed I/O.
 - **Verify** is independently visible and never counted as copying.
@@ -235,8 +237,8 @@ mode to tune the policy.
 - Make cancellation cooperative and document the last safe cancellation point.
 - Never silently overwrite a destination under the default policy.
 - Keep recycle and permanent deletion as distinct modes. Permanent deletion
-  requires a typed confirmation and must warn that a directory failure can be
-  partial.
+  requires a typed confirmation, shows exact reviewed file/folder/byte totals,
+  and reports entry-by-entry removal progress and any partial result.
 - Offer Windows elevation only after a permission-denied delete failure and
   only from a non-elevated process. A new elevated process must require a fresh
   plan and review rather than replaying the failed operation automatically.
