@@ -33,7 +33,10 @@ only the newest request, checks cancellation throughout traversal, and keys each
 result by pane, pane generation, path, and request id. Rapid scrolling therefore
 replaces old work instead of building a queue, and stale results cannot attach to
 a different focused item. Folder analysis also yields whenever a reviewed file
-operation is active so it does not compete with planning or transfer I/O.
+operation is active so it does not compete with planning or transfer I/O. The
+worker emits throttled accumulated-byte and discovered-item updates, retains a
+small generation-scoped result cache, and reuses directory-entry metadata to
+avoid redundant Windows path lookups.
 
 ## Workspace crates
 
@@ -157,8 +160,8 @@ Windows hidden attributes are not yet considered.
 
 - Directory results arrive as one batch, not incrementally.
 - The selected set and filter string are not yet explicitly capped.
-- File timestamps are displayed as raw Unix time pending a deliberate local-time
-  formatting policy.
+- File timestamps are rendered as local calendar dates and times, with a labeled
+  UTC fallback when the local offset cannot be determined.
 - Symlinks are identified but cannot be followed from the UI.
 - Only dot-prefixed hidden files are recognized.
 - Inspector layout is hidden below 110 columns; a compact overlay is planned.

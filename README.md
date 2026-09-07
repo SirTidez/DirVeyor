@@ -15,7 +15,13 @@ Focusing a directory starts a replaceable background traversal. The inspector
 shows its total contained file size, file/folder counts, and that total as a
 percentage of the containing drive's capacity. Moving focus cancels stale work;
 links and inaccessible items are skipped and identified when the result is
-partial.
+partial. While traversal is running, live discovered bytes and file/folder
+counts provide an indeterminate progress indicator. Recently completed results
+are reused within the same pane generation when focus returns to a folder.
+
+Modified times are displayed in the machine's local time as readable calendar
+dates. UTC is labeled explicitly only if the operating system's local offset is
+unavailable.
 
 Every change is planned first and shown in a confirmation dialog. Existing
 destinations are never overwritten: copy and move conflicts receive numbered
