@@ -108,6 +108,7 @@ pub(crate) fn build_plan_with_progress(
             destination,
             cancelled,
             verification,
+            progress,
         ),
         OperationIntent::Move {
             sources,
@@ -120,6 +121,7 @@ pub(crate) fn build_plan_with_progress(
             destination,
             cancelled,
             verification,
+            progress,
         ),
         OperationIntent::Recycle { sources } => {
             build_delete(job, sources, false, cancelled, progress)
@@ -153,6 +155,7 @@ fn build_transfer(
     destination: PathBuf,
     cancelled: &AtomicBool,
     verification: fileadmin_domain::VerificationMode,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
 ) -> Result<OperationPlan, String> {
     check_cancelled(cancelled)?;
     let sources = validate_source_set(sources)?;
@@ -167,9 +170,6 @@ fn build_transfer(
 
     let mut roots = Vec::with_capacity(sources.len());
     let conflicts = Vec::new();
-    let mut item_count = 0_u64;
-    let mut file_count = 0_u64;
-    let mut total_bytes = 0_u64;
     let mut all_same_volume = true;
     let mut every_target_clear = true;
     let mut affected = vec![destination.clone()];
@@ -226,22 +226,15 @@ fn build_transfer(
             directories: Vec::new(),
             files: Vec::new(),
         };
-        item_count += 1;
-        match root.source_fingerprint.kind {
-            ObjectKind::File => {
-                file_count += 1;
-                total_bytes = total_bytes
-                    .checked_add(root.source_fingerprint.len)
-                    .ok_or_else(|| "Operation byte count overflowed".to_string())?;
-            }
-            ObjectKind::Directory => {}
-        }
         all_same_volume &= same_volume(source, &destination)?;
         if let Some(parent) = source.parent() {
             affected.push(parent.to_path_buf());
         }
         roots.push(root);
     }
+
+    let (item_count, file_count, total_bytes) =
+        count_transfer_scope(job, kind, &roots, cancelled, progress)?;
 
     affected.sort();
     affected.dedup();
@@ -270,8 +263,7 @@ fn build_transfer(
             format!("A bounded queue feeds {worker_count} concurrent file worker(s)"),
         ],
         PlannedStrategy::ParallelCopy => vec![
-            "Directories stream without a fixed item limit; colliding files pause for a choice"
-                .into(),
+            "Directory totals are counted without storing a file manifest; colliding files pause for a choice".into(),
             format!("A bounded queue feeds {worker_count} concurrent file worker(s)"),
         ],
         PlannedStrategy::AtomicRename => {
@@ -279,9 +271,7 @@ fn build_transfer(
         }
         _ => Vec::new(),
     };
-    let recursive_scope_known = roots
-        .iter()
-        .all(|root| root.source_fingerprint.kind == ObjectKind::File);
+    let recursive_scope_known = true;
     let action = if strategy == PlannedStrategy::AtomicRename {
         PlannedAction::AtomicMove { roots }
     } else {
@@ -311,6 +301,135 @@ fn build_transfer(
         action,
         affected_directories: affected,
     })
+}
+
+fn count_transfer_scope(
+    job: JobId,
+    kind: OperationKind,
+    roots: &[TransferRoot],
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
+) -> Result<(u64, u64, u64), String> {
+    let mut item_count = 0_u64;
+    let mut file_count = 0_u64;
+    let mut total_bytes = 0_u64;
+    for root in roots {
+        count_transfer_tree(
+            job,
+            kind,
+            &root.source,
+            Some(&root.source_fingerprint),
+            &mut item_count,
+            &mut file_count,
+            &mut total_bytes,
+            cancelled,
+            progress,
+        )?;
+        publish_transfer_count(
+            job,
+            kind,
+            &root.source,
+            item_count,
+            file_count,
+            total_bytes,
+            progress,
+        );
+    }
+    Ok((item_count, file_count, total_bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_transfer_tree(
+    job: JobId,
+    kind: OperationKind,
+    source: &Path,
+    known_fingerprint: Option<&Fingerprint>,
+    item_count: &mut u64,
+    file_count: &mut u64,
+    total_bytes: &mut u64,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
+) -> Result<(), String> {
+    check_cancelled(cancelled)?;
+    let owned_fingerprint;
+    let item_fingerprint = if let Some(fingerprint) = known_fingerprint {
+        fingerprint
+    } else {
+        let metadata = fs::symlink_metadata(source)
+            .map_err(|error| format!("Cannot inspect {}: {error}", source.display()))?;
+        reject_link_or_special(source, &metadata)?;
+        owned_fingerprint = fingerprint(&metadata)?;
+        &owned_fingerprint
+    };
+    *item_count = item_count
+        .checked_add(1)
+        .ok_or_else(|| "Operation item count overflowed".to_string())?;
+    match item_fingerprint.kind {
+        ObjectKind::File => {
+            *file_count = file_count
+                .checked_add(1)
+                .ok_or_else(|| "Operation file count overflowed".to_string())?;
+            *total_bytes = total_bytes
+                .checked_add(item_fingerprint.len)
+                .ok_or_else(|| "Operation byte count overflowed".to_string())?;
+        }
+        ObjectKind::Directory => {
+            let reader = fs::read_dir(source)
+                .map_err(|error| format!("Cannot enumerate {}: {error}", source.display()))?;
+            for child in reader {
+                let child = child.map_err(|error| {
+                    format!(
+                        "Directory enumeration failed in {}: {error}",
+                        source.display()
+                    )
+                })?;
+                count_transfer_tree(
+                    job,
+                    kind,
+                    &child.path(),
+                    None,
+                    item_count,
+                    file_count,
+                    total_bytes,
+                    cancelled,
+                    progress,
+                )?;
+            }
+        }
+    }
+    if *item_count == 1 || (*item_count).is_multiple_of(128) {
+        publish_transfer_count(
+            job,
+            kind,
+            source,
+            *item_count,
+            *file_count,
+            *total_bytes,
+            progress,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_transfer_count(
+    job: JobId,
+    kind: OperationKind,
+    current_path: &Path,
+    item_count: u64,
+    file_count: u64,
+    total_bytes: u64,
+    progress: &mut dyn FnMut(OperationPlanningProgress),
+) {
+    progress(OperationPlanningProgress {
+        job,
+        kind,
+        discovered_items: item_count,
+        discovered_files: file_count,
+        discovered_directories: item_count.saturating_sub(file_count),
+        discovered_bytes: total_bytes,
+        current_path: Some(current_path.to_path_buf()),
+    });
 }
 
 #[cfg(windows)]
@@ -983,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_plan_does_not_enumerate_directory_contents() {
+    fn transfer_plan_counts_directory_contents_without_storing_a_manifest() {
         let source_parent = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
         let root = source_parent.path().join("large-tree");
@@ -991,7 +1110,8 @@ mod tests {
         fs::write(root.join("child.txt"), b"not planned individually").unwrap();
         let cancelled = AtomicBool::new(false);
 
-        let plan = build_plan(
+        let mut last_progress = None;
+        let plan = build_plan_with_progress(
             JobId(4),
             OperationIntent::Copy {
                 sources: vec![root],
@@ -999,11 +1119,20 @@ mod tests {
                 verification: fileadmin_domain::VerificationMode::Full,
             },
             &cancelled,
+            &mut |update| last_progress = Some(update),
         )
         .unwrap();
 
-        assert_eq!(plan.summary.item_count, 1);
-        assert!(!plan.summary.recursive_scope_known);
+        assert_eq!(plan.summary.item_count, 2);
+        assert_eq!(plan.summary.file_count, 1);
+        assert_eq!(plan.summary.directory_count, 1);
+        assert_eq!(plan.summary.total_bytes, 24);
+        assert!(plan.summary.recursive_scope_known);
+        let progress = last_progress.expect("count scan should publish progress");
+        assert_eq!(progress.discovered_items, 2);
+        assert_eq!(progress.discovered_files, 1);
+        assert_eq!(progress.discovered_directories, 1);
+        assert_eq!(progress.discovered_bytes, 24);
         let PlannedAction::Transfer { roots, .. } = plan.action else {
             panic!("expected a streaming transfer");
         };

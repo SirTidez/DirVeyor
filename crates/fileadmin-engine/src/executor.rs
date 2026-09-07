@@ -214,7 +214,7 @@ fn execute_transfer(
     let queue_capacity = worker_count.saturating_mul(8).max(8);
     let (work_sender, work_receiver) = crossbeam_channel::bounded(queue_capacity);
     let stopped = Arc::new(AtomicBool::new(false));
-    let progress = Arc::new(StreamingProgress::default());
+    let progress = Arc::new(StreamingProgress::from_plan(plan));
     let journal = if remove_sources {
         match tempfile::tempfile() {
             Ok(file) => Some(Arc::new(Mutex::new(file))),
@@ -297,9 +297,12 @@ fn execute_transfer(
         }
 
         if !stopped.load(Ordering::Acquire) && !cancel_requested.load(Ordering::Acquire) {
+            let items = progress.total_items.load(Ordering::Acquire);
+            let files = progress.total_files.load(Ordering::Acquire);
             let directories = progress.total_directories.load(Ordering::Acquire);
+            completed_items.store(items, Ordering::Release);
+            completed_files.store(files, Ordering::Release);
             completed_directories.store(directories, Ordering::Release);
-            completed_items.fetch_add(directories, Ordering::AcqRel);
             state.publish_phase(JobPhase::Finalizing, None);
             if remove_sources {
                 if let Err((path, message)) =
@@ -342,6 +345,22 @@ struct StreamingProgress {
     total_directories: AtomicU64,
     total_bytes: AtomicU64,
     scope_complete: AtomicBool,
+}
+
+impl StreamingProgress {
+    fn from_plan(plan: &OperationPlan) -> Self {
+        if plan.summary.recursive_scope_known {
+            Self {
+                total_items: AtomicU64::new(plan.summary.item_count),
+                total_files: AtomicU64::new(plan.summary.file_count),
+                total_directories: AtomicU64::new(plan.summary.directory_count),
+                total_bytes: AtomicU64::new(plan.summary.total_bytes),
+                scope_complete: AtomicBool::new(true),
+            }
+        } else {
+            Self::default()
+        }
+    }
 }
 
 struct PreparedFile {
@@ -399,20 +418,27 @@ impl<'a> StreamingTransfer<'a> {
         let fingerprint = crate::planner::fingerprint(&metadata)
             .map_err(|message| (source.to_path_buf(), message))?;
         revalidate(source, &fingerprint).map_err(|message| (source.to_path_buf(), message))?;
-        self.progress.total_items.fetch_add(1, Ordering::AcqRel);
+        let totals_known = self.plan.summary.recursive_scope_known;
+        if !totals_known {
+            self.progress.total_items.fetch_add(1, Ordering::AcqRel);
+        }
         match fingerprint.kind {
             ObjectKind::File => {
-                self.progress.total_files.fetch_add(1, Ordering::AcqRel);
-                self.progress
-                    .total_bytes
-                    .fetch_add(fingerprint.len, Ordering::AcqRel);
+                if !totals_known {
+                    self.progress.total_files.fetch_add(1, Ordering::AcqRel);
+                    self.progress
+                        .total_bytes
+                        .fetch_add(fingerprint.len, Ordering::AcqRel);
+                }
                 self.publish(Some(source.to_path_buf()));
                 self.visit_file(source, requested_target, fingerprint)
             }
             ObjectKind::Directory => {
-                self.progress
-                    .total_directories
-                    .fetch_add(1, Ordering::AcqRel);
+                if !totals_known {
+                    self.progress
+                        .total_directories
+                        .fetch_add(1, Ordering::AcqRel);
+                }
                 let Some(target) = self.directory_target(source, requested_target, &fingerprint)?
                 else {
                     return Ok(());
@@ -1233,8 +1259,7 @@ fn execute_atomic_moves(
             push_failure(failures, Some(root.source.clone()), error.to_string());
             return;
         }
-        let root_items = (root.directories.len() + root.files.len()) as u64;
-        let items = completed_items.fetch_add(root_items, Ordering::AcqRel) + root_items;
+        let items = completed_items.fetch_add(1, Ordering::AcqRel) + 1;
         send_progress(
             events,
             plan,
@@ -1244,6 +1269,15 @@ fn execute_atomic_moves(
             Some(root.target.clone()),
         );
     }
+    completed_items.store(plan.summary.item_count, Ordering::Release);
+    send_progress(
+        events,
+        plan,
+        JobPhase::Finalizing,
+        plan.summary.item_count,
+        plan.summary.total_bytes,
+        plan.summary.destination.clone(),
+    );
 }
 
 fn execute_recycle(

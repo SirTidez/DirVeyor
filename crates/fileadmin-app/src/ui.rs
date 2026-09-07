@@ -1322,7 +1322,11 @@ fn render_planning(
     let popup = centered_rect(74, 28, area);
     let mut lines = vec![
         Line::styled(
-            format!("Discovering exact scope for {}…", progress.kind.label()),
+            format!(
+                "{} Counting exact scope for {}…",
+                folder_size_spinner(),
+                progress.kind.label()
+            ),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1335,6 +1339,7 @@ fn render_planning(
             human_size(progress.discovered_bytes)
         )),
         Line::raw(format!("Entries inspected: {}", progress.discovered_items)),
+        Line::raw("Metadata-only scan · no transfer has started."),
         Line::raw("No files have changed."),
     ];
     if let Some(path) = &progress.current_path {
@@ -1541,6 +1546,14 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
                 progress.completed_items, progress.total_items
             )
         }));
+        lines.push(Line::raw(format!(
+            "Files: {} / {}",
+            progress.completed_files, progress.total_files
+        )));
+        lines.push(Line::raw(format!(
+            "Folders: {} / {}",
+            progress.completed_directories, progress.total_directories
+        )));
         lines.push(Line::raw(format!(
             "Transferred: {} / {}",
             human_size(progress.completed_bytes),
@@ -2200,6 +2213,8 @@ mod tests {
         let screen = rendered_screen(&app, 120, 30);
         assert!(screen.contains("Operation in progress"));
         assert!(screen.contains("Items: 2 / 4"));
+        assert!(screen.contains("Files: 2 / 4"));
+        assert!(screen.contains("Folders: 0 / 0"));
         assert!(screen.contains("50%"));
         assert!(screen.contains("Cancel safely"));
     }
