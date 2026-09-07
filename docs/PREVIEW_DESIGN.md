@@ -1,6 +1,6 @@
 # Text file preview design
 
-Status: proposed implementation plan
+Status: core preview implemented; large-file navigation and change monitoring pending
 
 ## 1. Goal
 
@@ -198,8 +198,9 @@ PreviewDocument
 
 `fileadmin-fs` owns a dedicated read-only preview service with a replaceable
 request slot and bounded result channel. It reads bytes, classifies content,
-decodes text, and reports source identity. It performs no rendering and never
-writes the file.
+decodes text, and reports source identity. Markdown and JSON transformation also
+run on this reader thread. It performs no terminal rendering and never writes
+the file.
 
 A focused transformation module converts decoded snapshots into presentation
 blocks. Markdown parsing and JSON parsing happen off the UI thread. Candidate
@@ -209,10 +210,10 @@ begins. Ratatui conversion remains in `fileadmin-app`, while reusable preview
 state belongs in `fileadmin-domain`.
 
 Preview search state stores the query, Literal/Regex mode, case mode, bounded
-match spans, active match, and whether results cover the complete file. Regex
-compilation and matching happen away from the render loop. A candidate Rust
-regex library and its resource-limit controls must be validated at the start of
-implementation.
+match spans, active match, and whether results cover the complete file. The
+implemented first pass searches only the bounded in-memory representation and
+caps both pattern and result sizes. Moving search compilation and matching to a
+replaceable worker remains follow-up work before increasing snapshot limits.
 
 If the source length or modified time changes after loading, Preview shows
 `File changed on disk · r Reload`; it does not silently replace the content and
@@ -248,28 +249,28 @@ move the user's scroll position.
 
 ## 8. Delivery slices
 
-### Slice 1 — bounded raw preview
+### Slice 1 — bounded raw preview (implemented)
 
 - `p` and file-aware `Enter` routing;
 - text/binary classification and UTF-8/BOM decoding;
 - line-numbered raw view, scrolling, wrapping, and close/restore behavior;
 - literal and regex Find with highlighting and next/previous navigation;
-- loading, unsupported, changed, windowed, and safe-error states;
+- loading, unsupported, windowed, and safe-error states;
 - source/config/log/text extension coverage.
 
-### Slice 2 — structured representations
+### Slice 2 — structured representations (implemented)
 
 - Markdown Raw, Split, and Rendered modes;
 - inert CommonMark/GFM block rendering;
 - JSON Pretty and Raw modes with line/column parse errors;
 - mode-aware footer and help.
 
-### Slice 3 — large-file navigation
+### Slice 3 — large-file navigation (partial)
 
-- head/tail/middle byte windows with multibyte-safe boundaries;
-- bounded line indexes and adjacent-window loading;
-- search result caps and partial-search labeling;
-- reload after file changes.
+- implemented: bounded head/tail snapshots, line indexes, search-result caps,
+  partial-search labeling, and manual reload;
+- pending: middle/adjacent-window loading, multibyte boundary carry-over, and
+  automatic changed-file detection.
 
 ### Slice 4 — polish and measured optimization
 

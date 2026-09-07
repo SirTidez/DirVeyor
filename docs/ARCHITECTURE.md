@@ -187,11 +187,19 @@ Media-aware concurrency should distinguish rotational disks, solid-state media,
 network shares, and removable storage rather than using the current conservative
 two-worker ceiling.
 
-## Planned text preview boundary
+## Text preview boundary
 
-Text Preview is specified as a full-screen, read-only application mode with a
-dedicated replaceable reader request. Decoding, Markdown transformation, JSON
-formatting, and bounded literal/regex search must stay off the render loop.
-Neither preview contents nor search terms may enter diagnostic or operation
-logs. The complete interaction, resource-limit, and delivery plan is in
+Text Preview is implemented as a full-screen, read-only application mode with
+a dedicated replaceable reader request. The background reader owns bounded file
+I/O, classification, decoding, Markdown transformation, and JSON formatting.
+Reusable document, presentation, and search state remains in
+`fileadmin-domain`; Ratatui rendering and input routing remain in
+`fileadmin-app`. Neither preview contents nor search terms enter diagnostic or
+operation logs.
+
+The current search pass runs against the bounded in-memory representation when
+the query changes. Files through 8 MiB may be complete snapshots; larger files
+use a 1 MiB head or tail snapshot. Moving adjacent windows, automatic file-change
+detection, and asynchronous search are the next performance slice. The full
+interaction, resource-limit, and delivery plan is in
 [Text file preview design](PREVIEW_DESIGN.md).
