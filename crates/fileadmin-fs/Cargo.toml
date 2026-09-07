@@ -11,12 +11,10 @@ repository.workspace = true
 fileadmin-domain = { path = "../fileadmin-domain" }
 pulldown-cmark.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_WindowsProgramming",
 ] }
-
-[dev-dependencies]
-tempfile.workspace = true

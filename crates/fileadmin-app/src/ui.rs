@@ -77,6 +77,8 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
     if app.help_visible {
         render_help(frame, area);
+    } else if app.favorites_panel.is_some() {
+        render_favorites_panel(frame, area, app);
     } else if let Some(prompt) = &app.text_prompt {
         render_text_prompt(frame, area, prompt);
     } else if !matches!(app.operation, OperationView::Idle) {
@@ -122,7 +124,7 @@ fn render_preview(frame: &mut Frame, area: Rect, preview: &PreviewState) {
                 Line::raw(""),
                 Line::raw(safe_text(message)),
                 Line::raw(""),
-                Line::styled("r Retry · Esc/q Back", Style::default().fg(Color::Cyan)),
+                Line::styled("R Retry · Esc/Q Back", Style::default().fg(Color::Cyan)),
             ];
             frame.render_widget(
                 Paragraph::new(lines)
@@ -391,13 +393,13 @@ fn preview_status(session: &PreviewSession) -> String {
             "Ignore case"
         };
         return format!(
-            " Find: {}_ · {} · {case} · Ctrl+r Mode · Alt+c Case",
+            " Find: {}_ · {} · {case} · Ctrl+R Mode · Alt+C Case",
             safe_text(&session.search.query),
             session.search.mode.label()
         );
     }
     if session.source_changed {
-        return "File changed on disk · r Reload".into();
+        return "File changed on disk · R Reload".into();
     }
     if let Some(error) = &session.search.error {
         return safe_text(error);
@@ -449,7 +451,7 @@ fn preview_footer(session: &PreviewSession) -> String {
         _ => "",
     };
     format!(
-        " Esc/q Back  ↑↓ Scroll  PgUp/PgDn  [/] Window  g/G First/Last  {modes}/ Find  n/N Match  r Reload"
+        " Esc/Q Back  ↑↓ Scroll  PgUp/PgDn  [/] Window  G/Shift+G First/Last  {modes}/ Find  N/Shift+N Match  R Reload"
     )
 }
 
@@ -463,21 +465,21 @@ fn render_preview_help(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::raw("Esc / q            Return to Browse"),
-        Line::raw("↑ ↓ / j k          Scroll"),
+        Line::raw("Esc / Q            Return to Browse"),
+        Line::raw("↑ ↓ / J K          Scroll"),
         Line::raw("PageUp / PageDown  Scroll by page"),
         Line::raw("Home / End          Start/end of loaded window"),
         Line::raw("[ / ]               Previous / next file window"),
-        Line::raw("g / G               First / last file window"),
+        Line::raw("G / Shift+G         First / last file window"),
         Line::raw("← →                 Horizontal scroll"),
-        Line::raw("w                   Toggle wrapping"),
+        Line::raw("W                   Toggle wrapping"),
         Line::raw("1 / 2 / 3           Raw / Split / Preview"),
         Line::raw("Tab                 Focus split region"),
-        Line::raw("/ / Ctrl+f          Find"),
-        Line::raw("Ctrl+r in Find      Literal / Regex"),
-        Line::raw("Alt+c in Find       Toggle case matching"),
-        Line::raw("n / N / F3          Next / previous match"),
-        Line::raw("r                   Reload"),
+        Line::raw("/ / Ctrl+F          Find"),
+        Line::raw("Ctrl+R in Find      Literal / Regex"),
+        Line::raw("Alt+C in Find       Toggle case matching"),
+        Line::raw("N / Shift+N / F3    Next / previous match"),
+        Line::raw("R                   Reload"),
         Line::raw(""),
         Line::styled("Esc / F1 Close help", Style::default().fg(Color::Cyan)),
     ];
@@ -569,7 +571,7 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
         return;
     }
     let indices = pane.visible_indices();
-    if indices.is_empty() {
+    if indices.is_empty() && !pane.browsing_drives {
         let message = if pane.filter.is_empty() {
             "This folder is empty"
         } else {
@@ -584,21 +586,45 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
         return;
     }
 
+    let rows = browser_rows(pane, &indices);
     let height = area.height as usize;
-    let start = pane.cursor.saturating_sub(height.saturating_sub(1));
-    let end = (start + height).min(indices.len());
+    let focused_row = rows
+        .iter()
+        .position(|row| matches!(row, BrowserRow::Entry { visible_position, .. } if *visible_position == pane.cursor))
+        .unwrap_or(0);
+    let start = focused_row.saturating_sub(height.saturating_sub(1));
+    let end = (start + height).min(rows.len());
     let name_width = area.width.saturating_sub(16) as usize;
     let mut lines = Vec::with_capacity(end - start);
 
-    for (visible_position, &entry_index) in indices[start..end].iter().enumerate() {
-        let row = start + visible_position;
-        let entry = &pane.entries[entry_index];
-        let focused = active && row == pane.cursor;
+    for row in &rows[start..end] {
+        let BrowserRow::Entry {
+            visible_position,
+            entry_index,
+        } = row
+        else {
+            let (text, style) = match row {
+                BrowserRow::Heading(text) => (
+                    *text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                BrowserRow::Empty(text) => (*text, Style::default().fg(Color::DarkGray)),
+                BrowserRow::Entry { .. } => unreachable!(),
+            };
+            lines.push(Line::styled(text, style));
+            continue;
+        };
+        let entry = &pane.entries[*entry_index];
+        let focused = active && *visible_position == pane.cursor;
         let selected = pane.selected.contains(&entry.path);
         let cursor = if focused { ">" } else { " " };
         let check = if selected { "[x]" } else { "[ ]" };
         let kind = match entry.kind {
             EntryKind::Parent => "↑",
+            EntryKind::Home => "⌂",
+            EntryKind::Favorite => "★",
             EntryKind::Drive => "◆",
             EntryKind::Directory => "/",
             EntryKind::Symlink => "@",
@@ -612,6 +638,10 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
             .and_then(DriveInfo::used_percent)
             .map(|percent| format!("{percent}% used"))
             .or_else(|| entry.size.map(human_size))
+            .or_else(|| {
+                matches!(entry.kind, EntryKind::Home | EntryKind::Favorite)
+                    .then(|| "Shortcut".into())
+            })
             .unwrap_or_else(|| "—".into());
         let line = format!("{cursor}{check} {kind}{name} {size:>8}");
         let style = if focused {
@@ -621,7 +651,10 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
                 .add_modifier(Modifier::BOLD)
         } else if selected {
             Style::default().fg(Color::Cyan)
-        } else if entry.kind == EntryKind::Directory {
+        } else if matches!(
+            entry.kind,
+            EntryKind::Directory | EntryKind::Home | EntryKind::Favorite
+        ) {
             Style::default().fg(Color::LightBlue)
         } else {
             Style::default()
@@ -629,6 +662,77 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
         lines.push(Line::styled(line, style));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+enum BrowserRow {
+    Heading(&'static str),
+    Empty(&'static str),
+    Entry {
+        visible_position: usize,
+        entry_index: usize,
+    },
+}
+
+fn browser_rows(pane: &PaneState, indices: &[usize]) -> Vec<BrowserRow> {
+    if !pane.browsing_drives {
+        return indices
+            .iter()
+            .enumerate()
+            .map(|(visible_position, entry_index)| BrowserRow::Entry {
+                visible_position,
+                entry_index: *entry_index,
+            })
+            .collect();
+    }
+    let mut rows = Vec::new();
+    append_drive_group(
+        &mut rows,
+        pane,
+        indices,
+        "── User folder ──",
+        EntryKind::Home,
+        "  User folder unavailable",
+    );
+    append_drive_group(
+        &mut rows,
+        pane,
+        indices,
+        "── Favorites · F Add/remove ──",
+        EntryKind::Favorite,
+        "  No favorite folders yet",
+    );
+    append_drive_group(
+        &mut rows,
+        pane,
+        indices,
+        "── Drives ──",
+        EntryKind::Drive,
+        "  No drives available",
+    );
+    rows
+}
+
+fn append_drive_group(
+    rows: &mut Vec<BrowserRow>,
+    pane: &PaneState,
+    indices: &[usize],
+    heading: &'static str,
+    kind: EntryKind,
+    empty: &'static str,
+) {
+    rows.push(BrowserRow::Heading(heading));
+    let before = rows.len();
+    for (visible_position, entry_index) in indices.iter().enumerate() {
+        if pane.entries[*entry_index].kind == kind {
+            rows.push(BrowserRow::Entry {
+                visible_position,
+                entry_index: *entry_index,
+            });
+        }
+    }
+    if rows.len() == before {
+        rows.push(BrowserRow::Empty(empty));
+    }
 }
 
 fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -650,6 +754,13 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
         ));
         if let Some(drive) = &entry.drive_info {
             append_drive_details(&mut lines, drive);
+        } else if matches!(entry.kind, EntryKind::Home | EntryKind::Favorite) {
+            lines.push(Line::raw(format!("Type: {}", kind_label(entry.kind))));
+            lines.push(Line::raw(format!("Target: {}", entry.path.display())));
+            lines.push(Line::styled(
+                "F Add/remove favorite",
+                Style::default().fg(Color::Cyan),
+            ));
         } else {
             lines.push(Line::raw(format!("Type: {}", kind_label(entry.kind))));
             if entry.kind == EntryKind::Directory {
@@ -701,11 +812,11 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
         Line::raw(""),
         Line::styled("← Back · → Open/select", Style::default().fg(Color::Cyan)),
         Line::styled(
-            "p Preview · c Copy · m Move",
+            "P Preview · C Copy · M Move",
             Style::default().fg(Color::Cyan),
         ),
         Line::styled(
-            "d Recycle · r Rename · n Folder",
+            "D Recycle · R Rename · N Folder",
             Style::default().fg(Color::Cyan),
         ),
     ]);
@@ -884,9 +995,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             app.active().filter
         )
     } else if area.width >= 110 {
-        " Tab Pane  ↑↓ Move  ← Back  → Open/Select  Enter Open/Preview  c Copy  m Move  d Recycle  F1 Help".into()
+        " Tab Pane  ↑↓ Move  ← Back  → Open/Select  Enter Open/Preview  C Copy  M Move  D Recycle  F1 Help".into()
     } else {
-        " ↑↓ Move  ← Back  → Open/Select  Enter Open  p Preview  F1 Help".into()
+        " ↑↓ Move  ← Back  → Open/Select  Enter Open  P Preview  F1 Help".into()
     };
     frame.render_widget(
         Paragraph::new(truncate(&text, area.width as usize))
@@ -905,19 +1016,20 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw("Tab / Shift+Tab   Switch pane"),
-        Line::raw("↑ ↓ or j k         Move focus"),
+        Line::raw("↑ ↓ or J K         Move focus"),
         Line::raw("← / Backspace      Parent folder"),
         Line::raw("→                   Open folder / toggle file selection"),
         Line::raw("Home / End         First / last item"),
         Line::raw("Space              Toggle selection"),
         Line::raw("Enter              Open folder or preview file"),
-        Line::raw("p                   Preview focused text file"),
+        Line::raw("P                   Preview focused text file"),
         Line::raw("/                  Filter active pane"),
-        Line::raw("h / s              Toggle dotfiles / cycle sort"),
-        Line::raw("c / m              Plan copy / move to other pane"),
-        Line::raw("d / Delete         Plan move to Recycle Bin / Trash"),
-        Line::raw("r / F2 / n         Rename item / create folder"),
-        Line::raw("q / Ctrl+C         Quit"),
+        Line::raw("H / S              Toggle dotfiles / cycle sort"),
+        Line::raw("C / M              Plan copy / move to other pane"),
+        Line::raw("D / Delete         Plan move to Recycle Bin / Trash"),
+        Line::raw("R / F2 / N         Rename item / create folder"),
+        Line::raw("F / Ctrl+F         Add favorite / open Favorites"),
+        Line::raw("Q / Ctrl+C         Quit"),
         Line::raw(""),
         Line::styled(
             "All mutations are planned and reviewed first. Existing destinations are never overwritten.",
@@ -936,6 +1048,77 @@ fn render_help(frame: &mut Frame, area: Rect) {
             .block(block)
             .wrap(Wrap { trim: false }),
         popup,
+    );
+}
+
+fn render_favorites_panel(frame: &mut Frame, area: Rect, app: &AppState) {
+    let popup = centered_rect(86, 80, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Favorites · {} folders ", app.favorites.len()))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [content, footer] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+    if app.favorites.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    "No favorite folders yet",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Line::raw(""),
+                Line::raw("Close this panel, focus a folder, and press F to add it."),
+            ])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+            content,
+        );
+    } else {
+        let cursor = app
+            .favorites_panel
+            .as_ref()
+            .map_or(0, |panel| panel.cursor.min(app.favorites.len() - 1));
+        let height = content.height as usize;
+        let start = cursor.saturating_sub(height.saturating_sub(1));
+        let lines = app.favorites[start..]
+            .iter()
+            .take(height)
+            .enumerate()
+            .map(|(offset, path)| {
+                let row = start + offset;
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Folder");
+                let marker = if row == cursor { ">" } else { " " };
+                let text = truncate(
+                    &format!("{marker} ★ {name}  {}", safe_text(&path.to_string_lossy())),
+                    content.width as usize,
+                );
+                Line::styled(
+                    text,
+                    if row == cursor {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), content);
+    }
+    frame.render_widget(
+        Paragraph::new("↑↓ Move · Enter/→ Open · F/Delete Remove · Ctrl+F/Esc Close")
+            .style(Style::default().fg(Color::Black).bg(Color::Gray))
+            .wrap(Wrap { trim: false }),
+        footer,
     );
 }
 
@@ -1155,7 +1338,7 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
         if progress.phase == JobPhase::Cancelling {
             "Cancellation requested · waiting for the current safe step"
         } else {
-            "x / c / Esc  Cancel safely"
+            "X / C / Esc  Cancel safely"
         },
         Style::default().fg(Color::Yellow),
     ));
@@ -1416,6 +1599,8 @@ fn human_size(bytes: u64) -> String {
 fn kind_label(kind: EntryKind) -> &'static str {
     match kind {
         EntryKind::Parent => "Parent directory",
+        EntryKind::Home => "User folder shortcut",
+        EntryKind::Favorite => "Favorite folder shortcut",
         EntryKind::Drive => "Drive",
         EntryKind::Directory => "Directory",
         EntryKind::File => "File",
@@ -1525,11 +1710,14 @@ mod tests {
         let footer = rendered_screen(&app, 120, 30);
         assert!(footer.contains("← Back"));
         assert!(footer.contains("→ Open/Select"));
+        assert!(footer.contains("C Copy"));
+        assert!(!footer.contains("c Copy"));
 
         app.help_visible = true;
         let help = rendered_screen(&app, 80, 24);
         assert!(help.contains("← / Backspace"));
         assert!(help.contains("→                   Open folder"));
+        assert!(help.contains("F / Ctrl+F"));
     }
 
     #[test]
@@ -1828,6 +2016,63 @@ mod tests {
         session.source_changed = true;
         app.preview = PreviewState::Ready(Box::new(session));
         let screen = rendered_screen(&app, 160, 30);
-        assert!(screen.contains("File changed on disk · r Reload"));
+        assert!(screen.contains("File changed on disk · R Reload"));
+    }
+
+    #[test]
+    fn all_drives_renders_user_favorites_and_drive_sections() {
+        let mut app = populated_app();
+        let pane = app.pane_mut(PaneId::Left);
+        pane.browsing_drives = true;
+        pane.entries = vec![
+            FileEntry {
+                path: PathBuf::from(r"C:\Users\tester"),
+                display_name: r"tester  C:\Users\tester".into(),
+                kind: EntryKind::Home,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            },
+            FileEntry {
+                path: PathBuf::from(r"D:\Projects"),
+                display_name: r"Projects  D:\Projects".into(),
+                kind: EntryKind::Favorite,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            },
+            FileEntry {
+                path: PathBuf::from("D:\\"),
+                display_name: "D:\\".into(),
+                kind: EntryKind::Drive,
+                size: None,
+                modified: None,
+                metadata_incomplete: true,
+                drive_info: None,
+            },
+        ];
+
+        let screen = rendered_screen(&app, 120, 30);
+
+        assert!(screen.contains("User folder"));
+        assert!(screen.contains("Favorites · F Add/remove"));
+        assert!(screen.contains("Projects"));
+        assert!(screen.contains("Drives"));
+    }
+
+    #[test]
+    fn dedicated_favorites_panel_lists_saved_paths_and_controls() {
+        let mut app = populated_app();
+        app.favorites = vec![PathBuf::from(r"D:\Projects")];
+        app.favorites_panel = Some(fileadmin_domain::FavoritesPanel::default());
+
+        let screen = rendered_screen(&app, 120, 30);
+
+        assert!(screen.contains("Favorites · 1 folders"));
+        assert!(screen.contains("★ Projects"));
+        assert!(screen.contains("F/Delete Remove"));
+        assert!(screen.contains("Ctrl+F/Esc Close"));
     }
 }

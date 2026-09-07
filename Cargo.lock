@@ -277,6 +277,7 @@ dependencies = [
  "fileadmin-fs",
  "ratatui",
  "regex",
+ "tempfile",
  "time",
  "unicode-width",
 ]

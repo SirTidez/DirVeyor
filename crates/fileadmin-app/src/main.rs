@@ -6,17 +6,18 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fileadmin_domain::{
-    AppState, EntryKind, FolderSizeProgress, FolderSizeState, LoadState, PaneId, PreviewMatch,
-    PreviewMode, PreviewRegion, PreviewSearchMode, PreviewSession, PreviewState,
-    PreviewWindowDirection, parent_or_same,
+    AppState, EntryKind, FavoritesPanel, FileEntry, FolderSizeProgress, FolderSizeState, LoadState,
+    PaneId, PreviewMatch, PreviewMode, PreviewRegion, PreviewSearchMode, PreviewSession,
+    PreviewState, PreviewWindowDirection, parent_or_same, paths_match,
 };
 use fileadmin_domain::{
     JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
 use fileadmin_fs::{
-    DirectoryScanner, FolderSizeScanner, FolderSizeUpdate, PreviewLoader, PreviewWindowTarget,
-    RequestError, ScanLocation, ScanRequest,
+    DirectoryScanner, FavoritesStore, FolderSizeScanner, FolderSizeUpdate, MAX_FAVORITES,
+    PreviewLoader, PreviewWindowTarget, RequestError, ScanLocation, ScanRequest,
+    user_home_directory,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -34,6 +35,12 @@ fn main() -> AppResult<()> {
     let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let right = parent_or_same(&current);
     let mut app = AppState::new(current, right);
+    let favorites = FavoritesStore::discover();
+    app.home_directory = user_home_directory();
+    match favorites.load() {
+        Ok(paths) => app.favorites = paths,
+        Err(error) => app.notice = Some(error),
+    }
     let scanner = DirectoryScanner::new();
     let folder_sizes = FolderSizeScanner::new();
     let previews = PreviewLoader::new();
@@ -51,6 +58,7 @@ fn main() -> AppResult<()> {
         &folder_sizes,
         &previews,
         &operations,
+        &favorites,
     )
 }
 
@@ -61,6 +69,7 @@ fn run(
     folder_sizes: &FolderSizeScanner,
     previews: &PreviewLoader,
     operations: &OperationEngine,
+    favorites: &FavoritesStore,
 ) -> AppResult<()> {
     while !app.should_quit {
         drain_scan_events(app, scanner);
@@ -75,7 +84,7 @@ fn run(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(app, scanner, previews, operations, key);
+            handle_key(app, scanner, previews, operations, favorites, key);
         }
     }
     Ok(())
@@ -168,16 +177,180 @@ fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner) {
 
 fn drain_scan_events(app: &mut AppState, scanner: &DirectoryScanner) {
     while let Ok(event) = scanner.try_recv() {
-        let pane = app.pane_mut(event.pane);
+        let browsing_drives = app.pane(event.pane).browsing_drives;
         match event.result {
-            Ok(listing) => {
+            Ok(mut listing) => {
+                if browsing_drives {
+                    listing.entries = quick_access_entries(app, listing.entries);
+                }
+                let pane = app.pane_mut(event.pane);
                 if pane.apply_entries(event.generation, listing.entries) {
                     pane.truncated = listing.truncated;
                 }
             }
             Err(error) => {
-                pane.apply_error(event.generation, error.message);
+                app.pane_mut(event.pane)
+                    .apply_error(event.generation, error.message);
             }
+        }
+    }
+}
+
+fn quick_access_entries(app: &AppState, mut drives: Vec<FileEntry>) -> Vec<FileEntry> {
+    drives.retain(|entry| entry.kind == EntryKind::Drive);
+    if let Some(home) = &app.home_directory {
+        drives.push(shortcut_entry(home.clone(), EntryKind::Home));
+    }
+    for path in &app.favorites {
+        if app
+            .home_directory
+            .as_ref()
+            .is_some_and(|home| paths_match(home, path))
+        {
+            continue;
+        }
+        drives.push(shortcut_entry(path.clone(), EntryKind::Favorite));
+    }
+    drives
+}
+
+fn shortcut_entry(path: PathBuf, kind: EntryKind) -> FileEntry {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Folder");
+    FileEntry {
+        display_name: format!("{name}  {}", path.display()),
+        path,
+        kind,
+        size: None,
+        modified: None,
+        metadata_incomplete: false,
+        drive_info: None,
+    }
+}
+
+fn toggle_favorite(app: &mut AppState, scanner: &DirectoryScanner, store: &FavoritesStore) {
+    let Some(entry) = app.active().focused() else {
+        app.notice = Some("Focus a folder to add or remove a favorite".into());
+        return;
+    };
+    if !matches!(
+        entry.kind,
+        EntryKind::Directory | EntryKind::Home | EntryKind::Favorite
+    ) {
+        app.notice = Some("Only folders can be added to Favorites".into());
+        return;
+    }
+    let path = entry.path.clone();
+    let mut updated = app.favorites.clone();
+    let existing = updated
+        .iter()
+        .position(|favorite| paths_match(favorite, &path));
+    let notice = if let Some(index) = existing {
+        updated.remove(index);
+        format!("Removed {} from Favorites", path.display())
+    } else {
+        if updated.len() >= MAX_FAVORITES {
+            app.notice = Some("Favorites are limited to 256 folders".into());
+            return;
+        }
+        updated.push(path.clone());
+        format!("Added {} to Favorites", path.display())
+    };
+    match store.save(&updated) {
+        Ok(()) => {
+            app.favorites = updated;
+            app.notice = Some(notice);
+            refresh_drive_shortcut_panes(app, scanner);
+        }
+        Err(error) => app.notice = Some(error),
+    }
+}
+
+fn handle_favorites_key(
+    app: &mut AppState,
+    scanner: &DirectoryScanner,
+    store: &FavoritesStore,
+    key: KeyEvent,
+) {
+    let length = app.favorites.len();
+    let cursor = app
+        .favorites_panel
+        .as_ref()
+        .map_or(0, |panel| panel.cursor.min(length.saturating_sub(1)));
+    if (key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F')))
+        || matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+        )
+    {
+        app.favorites_panel = None;
+        return;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+            if let Some(panel) = &mut app.favorites_panel {
+                panel.cursor = cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+            if let Some(panel) = &mut app.favorites_panel {
+                panel.cursor = cursor.saturating_add(1).min(length.saturating_sub(1));
+            }
+        }
+        KeyCode::Home => {
+            if let Some(panel) = &mut app.favorites_panel {
+                panel.cursor = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(panel) = &mut app.favorites_panel {
+                panel.cursor = length.saturating_sub(1);
+            }
+        }
+        KeyCode::Enter | KeyCode::Right if length > 0 => {
+            let path = app.favorites[cursor].clone();
+            app.favorites_panel = None;
+            navigate_to(app, scanner, path);
+        }
+        KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Delete if length > 0 => {
+            let mut updated = app.favorites.clone();
+            let removed = updated.remove(cursor);
+            match store.save(&updated) {
+                Ok(()) => {
+                    app.favorites = updated;
+                    if let Some(panel) = &mut app.favorites_panel {
+                        panel.cursor = cursor.min(app.favorites.len().saturating_sub(1));
+                    }
+                    app.notice = Some(format!("Removed {} from Favorites", removed.display()));
+                    refresh_drive_shortcut_panes(app, scanner);
+                }
+                Err(error) => app.notice = Some(error),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn refresh_drive_shortcut_panes(app: &mut AppState, scanner: &DirectoryScanner) {
+    for pane_id in PaneId::ALL {
+        if !app.pane(pane_id).browsing_drives {
+            continue;
+        }
+        let focus = app.pane(pane_id).focused().map(|entry| entry.path.clone());
+        let generation = app
+            .pane_mut(pane_id)
+            .begin_drive_list_restoring_focus(focus);
+        if let Err(error) = scanner.request(ScanRequest {
+            pane: pane_id,
+            generation,
+            location: ScanLocation::Drives,
+        }) {
+            app.pane_mut(pane_id)
+                .apply_error(generation, request_error_message(error));
         }
     }
 }
@@ -187,6 +360,7 @@ fn handle_key(
     scanner: &DirectoryScanner,
     previews: &PreviewLoader,
     operations: &OperationEngine,
+    favorites: &FavoritesStore,
     key: KeyEvent,
 ) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -196,6 +370,11 @@ fn handle_key(
 
     if app.preview.is_open() {
         handle_preview_key(app, previews, key);
+        return;
+    }
+
+    if app.favorites_panel.is_some() {
+        handle_favorites_key(app, scanner, favorites, key);
         return;
     }
 
@@ -238,11 +417,18 @@ fn handle_key(
         return;
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+    {
+        app.favorites_panel = Some(FavoritesPanel::default());
+        return;
+    }
+
     match key.code {
-        KeyCode::Char('q') => request_quit(app, operations),
+        KeyCode::Char('q') | KeyCode::Char('Q') => request_quit(app, operations),
         KeyCode::Tab | KeyCode::BackTab => app.switch_pane(),
-        KeyCode::Up | KeyCode::Char('k') => app.active_mut().move_cursor(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.active_mut().move_cursor(1),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => app.active_mut().move_cursor(-1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => app.active_mut().move_cursor(1),
         KeyCode::Home => app.active_mut().cursor = 0,
         KeyCode::End => {
             let last = app.active().visible_len().saturating_sub(1);
@@ -256,7 +442,7 @@ fn handle_key(
             app.filter_mode = true;
             app.notice = Some("Type to filter this pane; Enter or Esc closes the filter".into());
         }
-        KeyCode::Char('h') => {
+        KeyCode::Char('h') | KeyCode::Char('H') => {
             let shown = {
                 let pane = app.active_mut();
                 pane.show_hidden = !pane.show_hidden;
@@ -272,17 +458,24 @@ fn handle_key(
                 .into(),
             );
         }
-        KeyCode::Char('s') => {
+        KeyCode::Char('s') | KeyCode::Char('S') => {
             app.active_mut().cycle_sort();
             app.notice = Some(format!("Sorted by {}", app.active().sort.label()));
         }
         KeyCode::Char('?') | KeyCode::F(1) => app.help_visible = true,
-        KeyCode::Char('c') => submit_transfer(app, operations, OperationKind::Copy),
-        KeyCode::Char('m') => submit_transfer(app, operations, OperationKind::Move),
-        KeyCode::Char('d') | KeyCode::Delete => submit_recycle(app, operations),
-        KeyCode::Char('r') | KeyCode::F(2) => begin_rename(app),
-        KeyCode::Char('n') => begin_create_directory(app),
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            submit_transfer(app, operations, OperationKind::Copy)
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            submit_transfer(app, operations, OperationKind::Move)
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+            submit_recycle(app, operations)
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::F(2) => begin_rename(app),
+        KeyCode::Char('n') | KeyCode::Char('N') => begin_create_directory(app),
         KeyCode::Char('p') | KeyCode::Char('P') => begin_preview(app, previews),
+        KeyCode::Char('f') | KeyCode::Char('F') => toggle_favorite(app, scanner, favorites),
         _ => {}
     }
 }
@@ -349,7 +542,11 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
         OperationView::Running(progress) => {
             if matches!(
                 key.code,
-                KeyCode::Char('x') | KeyCode::Char('c') | KeyCode::Esc
+                KeyCode::Char('x')
+                    | KeyCode::Char('X')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('C')
+                    | KeyCode::Esc
             ) {
                 operations.cancel();
                 let mut progress = progress.clone();
@@ -474,7 +671,7 @@ fn begin_rename(app: &mut AppState) {
     let Some(entry) = app
         .active()
         .focused()
-        .filter(|entry| !entry.is_parent() && !entry.is_drive())
+        .filter(|entry| !entry.is_virtual_location())
     else {
         app.notice = Some("Focus a file or directory to rename".into());
         return;
@@ -583,9 +780,13 @@ fn open_or_select_focused(
     previews: &PreviewLoader,
 ) {
     match app.active().focused().map(|entry| entry.kind) {
-        Some(EntryKind::Parent | EntryKind::Drive | EntryKind::Directory) => {
-            open_focused_or_retry(app, scanner, previews)
-        }
+        Some(
+            EntryKind::Parent
+            | EntryKind::Home
+            | EntryKind::Favorite
+            | EntryKind::Drive
+            | EntryKind::Directory,
+        ) => open_focused_or_retry(app, scanner, previews),
         Some(EntryKind::File) => app.active_mut().toggle_focused_selection(),
         _ => {}
     }
@@ -667,7 +868,7 @@ fn drain_preview_change_events(app: &mut AppState, previews: &PreviewLoader) {
                 if session.document.path == event.path =>
             {
                 session.source_changed = true;
-                session.notice = Some("File changed on disk · r Reload".into());
+                session.notice = Some("File changed on disk · R Reload".into());
             }
             _ => {}
         }
@@ -784,23 +985,29 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
     match &mut app.preview {
         PreviewState::Closed => {}
         PreviewState::Loading { .. } => {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+            ) {
                 previews.cancel();
                 app.preview = PreviewState::Closed;
             }
         }
         PreviewState::LoadingWindow { .. } => {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+            ) {
                 previews.cancel();
                 app.preview = PreviewState::Closed;
             }
         }
         PreviewState::Failed { path, .. } => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 previews.cancel();
                 app.preview = PreviewState::Closed;
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
                 let path = path.clone();
                 let request_id = previews.request(path.clone());
                 app.preview = PreviewState::Loading { request_id, path };
@@ -811,7 +1018,11 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
             if session.help_visible {
                 if matches!(
                     key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1)
+                    KeyCode::Esc
+                        | KeyCode::Char('q')
+                        | KeyCode::Char('Q')
+                        | KeyCode::Char('?')
+                        | KeyCode::F(1)
                 ) {
                     session.help_visible = false;
                 }
@@ -822,7 +1033,7 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 return;
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                     previews.cancel();
                     app.preview = PreviewState::Closed;
                 }
@@ -830,7 +1041,9 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                     session.search.editing = true;
                     recompute_preview_search(session);
                 }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     session.search.editing = true;
                     recompute_preview_search(session);
                 }
@@ -840,8 +1053,12 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                     move_preview_match(session, 1)
                 }
                 KeyCode::Char('N') | KeyCode::F(3) => move_preview_match(session, -1),
-                KeyCode::Up | KeyCode::Char('k') => scroll_preview(session, -1),
-                KeyCode::Down | KeyCode::Char('j') => scroll_preview(session, 1),
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                    scroll_preview(session, -1)
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    scroll_preview(session, 1)
+                }
                 KeyCode::PageUp => scroll_preview(session, -20),
                 KeyCode::PageDown => scroll_preview(session, 20),
                 KeyCode::Home | KeyCode::Char('g') => *session.active_scroll_mut() = 0,
@@ -855,7 +1072,7 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 KeyCode::Right if !session.wrap => {
                     session.horizontal_scroll = session.horizontal_scroll.saturating_add(4)
                 }
-                KeyCode::Char('w') => session.wrap = !session.wrap,
+                KeyCode::Char('w') | KeyCode::Char('W') => session.wrap = !session.wrap,
                 KeyCode::Tab if session.mode == PreviewMode::Split => {
                     session.active_region = match session.active_region {
                         PreviewRegion::Raw => PreviewRegion::Formatted,
@@ -868,8 +1085,8 @@ fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEven
                 KeyCode::Char('1') => set_preview_mode(session, PreviewMode::Raw),
                 KeyCode::Char('2') => set_preview_mode(session, PreviewMode::Split),
                 KeyCode::Char('3') => set_preview_mode(session, PreviewMode::Formatted),
-                KeyCode::Char('v') => cycle_preview_mode(session),
-                KeyCode::Char('r') => {
+                KeyCode::Char('v') | KeyCode::Char('V') => cycle_preview_mode(session),
+                KeyCode::Char('r') | KeyCode::Char('R') => {
                     let path = session.document.path.clone();
                     previews.clear_watch();
                     let request_id = previews.request(path.clone());
@@ -896,14 +1113,16 @@ fn handle_preview_search_key(session: &mut PreviewSession, key: KeyEvent) {
             session.search.query.pop();
             recompute_preview_search(session);
         }
-        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('r') | KeyCode::Char('R')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             session.search.mode = match session.search.mode {
                 PreviewSearchMode::Literal => PreviewSearchMode::Regex,
                 PreviewSearchMode::Regex => PreviewSearchMode::Literal,
             };
             recompute_preview_search(session);
         }
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyCode::Char('c') | KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::ALT) => {
             session.search.case_sensitive = !session.search.case_sensitive;
             recompute_preview_search(session);
         }
@@ -1267,6 +1486,7 @@ mod preview_tests {
         let scanner = DirectoryScanner::new();
         let previews = PreviewLoader::new();
         let operations = OperationEngine::new();
+        let favorites = FavoritesStore::discover();
         let mut app = app_with_focused_file();
 
         handle_key(
@@ -1274,6 +1494,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
         );
         assert!(matches!(app.preview, PreviewState::Loading { .. }));
@@ -1285,6 +1506,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
         );
         assert!(matches!(app.preview, PreviewState::Loading { .. }));
@@ -1296,6 +1518,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(matches!(app.preview, PreviewState::Loading { .. }));
@@ -1375,6 +1598,7 @@ mod preview_tests {
         let scanner = DirectoryScanner::new();
         let previews = PreviewLoader::new();
         let operations = OperationEngine::new();
+        let favorites = FavoritesStore::discover();
         let mut app = app_with_focused_file();
         let path = app.active().focused().unwrap().path.clone();
 
@@ -1383,6 +1607,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         );
         assert!(app.active().selected.contains(&path));
@@ -1392,6 +1617,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         );
         assert!(!app.active().selected.contains(&path));
@@ -1402,6 +1628,7 @@ mod preview_tests {
         let scanner = DirectoryScanner::new();
         let previews = PreviewLoader::new();
         let operations = OperationEngine::new();
+        let favorites = FavoritesStore::discover();
         let root = PathBuf::from("browse-root");
         let child = root.join("child");
         let mut app = AppState::new(root.clone(), root.clone());
@@ -1423,6 +1650,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         );
         assert_eq!(app.active().location, child);
@@ -1434,6 +1662,7 @@ mod preview_tests {
             &scanner,
             &previews,
             &operations,
+            &favorites,
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
         );
         assert_eq!(app.active().location, root);
@@ -1462,5 +1691,115 @@ mod preview_tests {
             ],
         );
         assert_eq!(app.active().focused().unwrap().display_name, "child");
+    }
+
+    #[test]
+    fn quick_access_contains_home_favorites_and_drives_without_home_duplication() {
+        let home = PathBuf::from("users").join("tester");
+        let favorite = PathBuf::from("projects");
+        let mut app = AppState::new(PathBuf::from("root"), PathBuf::from("other"));
+        app.home_directory = Some(home.clone());
+        app.favorites = vec![home, favorite.clone()];
+        let entries = quick_access_entries(
+            &app,
+            vec![FileEntry {
+                path: PathBuf::from("D:\\"),
+                display_name: "D:\\".into(),
+                kind: EntryKind::Drive,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
+
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Home)
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Favorite)
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![favorite]
+        );
+        assert!(entries.iter().any(|entry| entry.kind == EntryKind::Drive));
+    }
+
+    #[test]
+    fn favorite_toggle_persists_and_ctrl_f_opens_the_panel() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FavoritesStore::from_path(temp.path().join("favorites.json"));
+        let scanner = DirectoryScanner::new();
+        let previews = PreviewLoader::new();
+        let operations = OperationEngine::new();
+        let root = PathBuf::from("root");
+        let favorite = root.join("project");
+        let mut app = AppState::new(root.clone(), root);
+        app.active_mut().apply_entries(
+            0,
+            vec![FileEntry {
+                path: favorite.clone(),
+                display_name: "project".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
+
+        toggle_favorite(&mut app, &scanner, &store);
+        assert_eq!(app.favorites, vec![favorite.clone()]);
+        assert_eq!(store.load().unwrap(), vec![favorite]);
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            &store,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        );
+        assert!(app.favorites_panel.is_some());
+    }
+
+    #[test]
+    fn favorites_panel_can_open_and_remove_saved_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FavoritesStore::from_path(temp.path().join("favorites.json"));
+        let scanner = DirectoryScanner::new();
+        let root = PathBuf::from("root");
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        let mut app = AppState::new(root.clone(), root);
+        app.favorites = vec![first, second.clone()];
+        store.save(&app.favorites).unwrap();
+        app.favorites_panel = Some(FavoritesPanel { cursor: 1 });
+
+        handle_favorites_key(
+            &mut app,
+            &scanner,
+            &store,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.favorites_panel.is_none());
+        assert_eq!(app.active().location, second);
+
+        app.favorites_panel = Some(FavoritesPanel { cursor: 1 });
+        handle_favorites_key(
+            &mut app,
+            &scanner,
+            &store,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(app.favorites, vec![PathBuf::from("first")]);
+        assert_eq!(store.load().unwrap(), app.favorites);
+        assert_eq!(app.favorites_panel.unwrap().cursor, 0);
     }
 }

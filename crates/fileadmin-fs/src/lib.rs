@@ -1,8 +1,10 @@
 //! Read-only filesystem scanning on bounded background workers.
 
+mod favorites;
 mod folder_size;
 mod preview;
 
+pub use favorites::{FavoritesStore, MAX_FAVORITES, user_home_directory};
 pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner, FolderSizeUpdate};
 pub use preview::{PreviewChangeEvent, PreviewEvent, PreviewLoader, PreviewWindowTarget};
 

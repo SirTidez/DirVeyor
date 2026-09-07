@@ -38,6 +38,8 @@ impl PaneId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
     Parent,
+    Home,
+    Favorite,
     Drive,
     Directory,
     File,
@@ -154,7 +156,11 @@ impl FileEntry {
     pub fn is_directory(&self) -> bool {
         matches!(
             self.kind,
-            EntryKind::Parent | EntryKind::Drive | EntryKind::Directory
+            EntryKind::Parent
+                | EntryKind::Home
+                | EntryKind::Favorite
+                | EntryKind::Drive
+                | EntryKind::Directory
         )
     }
 
@@ -164,6 +170,13 @@ impl FileEntry {
 
     pub fn is_drive(&self) -> bool {
         self.kind == EntryKind::Drive
+    }
+
+    pub fn is_virtual_location(&self) -> bool {
+        matches!(
+            self.kind,
+            EntryKind::Parent | EntryKind::Home | EntryKind::Favorite | EntryKind::Drive
+        )
     }
 }
 
@@ -342,10 +355,7 @@ impl PaneState {
         let Some(path) = self.focused().map(|entry| entry.path.clone()) else {
             return;
         };
-        if self
-            .focused()
-            .is_some_and(|entry| entry.is_parent() || entry.is_drive())
-        {
+        if self.focused().is_some_and(FileEntry::is_virtual_location) {
             return;
         }
         if !self.selected.remove(&path) {
@@ -383,13 +393,9 @@ impl PaneState {
     fn sort_entries(&mut self) {
         let sort = self.sort;
         self.entries.sort_by(|a, b| {
-            let parent_order = b.is_parent().cmp(&a.is_parent());
-            if !parent_order.is_eq() {
-                return parent_order;
-            }
-            let directory_order = b.is_directory().cmp(&a.is_directory());
-            if !directory_order.is_eq() {
-                return directory_order;
+            let kind_order = entry_sort_group(a.kind).cmp(&entry_sort_group(b.kind));
+            if !kind_order.is_eq() {
+                return kind_order;
             }
             let primary = match sort {
                 SortField::Name => a
@@ -427,14 +433,27 @@ impl PaneState {
     }
 }
 
+fn entry_sort_group(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::Parent => 0,
+        EntryKind::Home => 1,
+        EntryKind::Favorite => 2,
+        EntryKind::Drive => 3,
+        EntryKind::Directory => 4,
+        EntryKind::File => 5,
+        EntryKind::Symlink => 6,
+        EntryKind::Other => 7,
+    }
+}
+
 #[cfg(windows)]
-fn paths_match(left: &Path, right: &Path) -> bool {
+pub fn paths_match(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 #[cfg(not(windows))]
-fn paths_match(left: &Path, right: &Path) -> bool {
+pub fn paths_match(left: &Path, right: &Path) -> bool {
     left == right
 }
 
@@ -454,6 +473,14 @@ pub struct AppState {
     pub text_prompt: Option<TextPrompt>,
     pub folder_size: FolderSizeState,
     pub preview: PreviewState,
+    pub home_directory: Option<PathBuf>,
+    pub favorites: Vec<PathBuf>,
+    pub favorites_panel: Option<FavoritesPanel>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FavoritesPanel {
+    pub cursor: usize,
 }
 
 impl AppState {
@@ -464,13 +491,16 @@ impl AppState {
             help_visible: false,
             filter_mode: false,
             notice: Some(
-                "Ready · p Preview · c Copy · m Move · d Recycle · r Rename · n New folder".into(),
+                "Ready · P Preview · C Copy · M Move · D Recycle · R Rename · N New folder".into(),
             ),
             should_quit: false,
             operation: OperationView::Idle,
             text_prompt: None,
             folder_size: FolderSizeState::Idle,
             preview: PreviewState::Closed,
+            home_directory: None,
+            favorites: Vec::new(),
+            favorites_panel: None,
         }
     }
 
@@ -503,7 +533,7 @@ impl AppState {
         if pane.selected.is_empty() {
             return pane
                 .focused()
-                .filter(|entry| !entry.is_parent() && !entry.is_drive())
+                .filter(|entry| !entry.is_virtual_location())
                 .map(|entry| vec![entry.path.clone()])
                 .unwrap_or_default();
         }
@@ -723,5 +753,28 @@ mod tests {
         );
 
         assert_eq!(pane.focused().unwrap().display_name, "D:\\");
+    }
+
+    #[test]
+    fn virtual_shortcuts_cannot_be_selected_or_used_as_operation_sources() {
+        let path = PathBuf::from("favorite");
+        let mut app = AppState::new(PathBuf::from("root"), PathBuf::from("other"));
+        app.active_mut().apply_entries(
+            0,
+            vec![FileEntry {
+                path,
+                display_name: "favorite".into(),
+                kind: EntryKind::Favorite,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
+
+        app.active_mut().toggle_focused_selection();
+
+        assert!(app.active().selected.is_empty());
+        assert!(app.operation_sources().is_empty());
     }
 }

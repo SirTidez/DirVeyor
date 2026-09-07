@@ -16,3 +16,6 @@ ratatui.workspace = true
 regex.workspace = true
 time.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
