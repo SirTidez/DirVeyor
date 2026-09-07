@@ -6,17 +6,20 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fileadmin_domain::{
-    AppState, EntryKind, FolderSizeProgress, FolderSizeState, LoadState, PaneId, parent_or_same,
+    AppState, EntryKind, FolderSizeProgress, FolderSizeState, LoadState, PaneId, PreviewMatch,
+    PreviewMode, PreviewRegion, PreviewSearchMode, PreviewSession, PreviewState, parent_or_same,
 };
 use fileadmin_domain::{
     JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
 };
 use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
 use fileadmin_fs::{
-    DirectoryScanner, FolderSizeScanner, FolderSizeUpdate, RequestError, ScanLocation, ScanRequest,
+    DirectoryScanner, FolderSizeScanner, FolderSizeUpdate, PreviewLoader, RequestError,
+    ScanLocation, ScanRequest,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use regex::RegexBuilder;
 use std::error::Error;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -32,6 +35,7 @@ fn main() -> AppResult<()> {
     let mut app = AppState::new(current, right);
     let scanner = DirectoryScanner::new();
     let folder_sizes = FolderSizeScanner::new();
+    let previews = PreviewLoader::new();
     let operations = OperationEngine::new();
     queue_initial_scans(&mut app, &scanner);
 
@@ -44,6 +48,7 @@ fn main() -> AppResult<()> {
         &mut app,
         &scanner,
         &folder_sizes,
+        &previews,
         &operations,
     )
 }
@@ -53,12 +58,14 @@ fn run(
     app: &mut AppState,
     scanner: &DirectoryScanner,
     folder_sizes: &FolderSizeScanner,
+    previews: &PreviewLoader,
     operations: &OperationEngine,
 ) -> AppResult<()> {
     while !app.should_quit {
         drain_scan_events(app, scanner);
         drain_operation_events(app, scanner, operations);
         drain_folder_size_events(app, folder_sizes);
+        drain_preview_events(app, previews);
         sync_folder_size(app, folder_sizes);
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -66,7 +73,7 @@ fn run(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(app, scanner, operations, key);
+            handle_key(app, scanner, previews, operations, key);
         }
     }
     Ok(())
@@ -100,7 +107,7 @@ fn drain_folder_size_events(app: &mut AppState, folder_sizes: &FolderSizeScanner
 }
 
 fn sync_folder_size(app: &mut AppState, folder_sizes: &FolderSizeScanner) {
-    if !matches!(app.operation, OperationView::Idle) {
+    if !matches!(app.operation, OperationView::Idle) || app.preview.is_open() {
         if !matches!(app.folder_size, FolderSizeState::Idle) {
             folder_sizes.cancel();
             app.folder_size = FolderSizeState::Idle;
@@ -176,11 +183,17 @@ fn drain_scan_events(app: &mut AppState, scanner: &DirectoryScanner) {
 fn handle_key(
     app: &mut AppState,
     scanner: &DirectoryScanner,
+    previews: &PreviewLoader,
     operations: &OperationEngine,
     key: KeyEvent,
 ) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         request_quit(app, operations);
+        return;
+    }
+
+    if app.preview.is_open() {
+        handle_preview_key(app, previews, key);
         return;
     }
 
@@ -234,7 +247,7 @@ fn handle_key(
             app.active_mut().cursor = last;
         }
         KeyCode::Char(' ') => app.active_mut().toggle_focused_selection(),
-        KeyCode::Enter => open_focused_or_retry(app, scanner),
+        KeyCode::Enter => open_focused_or_retry(app, scanner, previews),
         KeyCode::Backspace => navigate_parent(app, scanner),
         KeyCode::Char('/') => {
             app.filter_mode = true;
@@ -266,6 +279,7 @@ fn handle_key(
         KeyCode::Char('d') | KeyCode::Delete => submit_recycle(app, operations),
         KeyCode::Char('r') | KeyCode::F(2) => begin_rename(app),
         KeyCode::Char('n') => begin_create_directory(app),
+        KeyCode::Char('p') | KeyCode::Char('P') => begin_preview(app, previews),
         _ => {}
     }
 }
@@ -528,7 +542,7 @@ fn outcome_label(outcome: JobOutcome) -> &'static str {
     }
 }
 
-fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner) {
+fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner, previews: &PreviewLoader) {
     let target = match &app.active().load_state {
         LoadState::Failed(_) if app.active().browsing_drives => {
             navigate_to_drives(app, scanner);
@@ -554,11 +568,310 @@ fn open_focused_or_retry(app: &mut AppState, scanner: &DirectoryScanner) {
             navigate_to(app, scanner, target);
         }
     } else if let Some(entry) = app.active().focused() {
-        app.notice = Some(format!(
-            "Inspecting {} (opening files is not enabled)",
-            entry.display_name
-        ));
+        let path = entry.path.clone();
+        begin_preview_path(app, previews, path);
     }
+}
+
+fn begin_preview(app: &mut AppState, previews: &PreviewLoader) {
+    let Some(path) = app
+        .active()
+        .focused()
+        .filter(|entry| !entry.is_parent() && !entry.is_drive() && !entry.is_directory())
+        .map(|entry| entry.path.clone())
+    else {
+        app.notice = Some("Focus a file to preview".into());
+        return;
+    };
+    begin_preview_path(app, previews, path);
+}
+
+fn begin_preview_path(app: &mut AppState, previews: &PreviewLoader, path: PathBuf) {
+    let request_id = previews.request(path.clone());
+    app.preview = PreviewState::Loading { request_id, path };
+}
+
+fn drain_preview_events(app: &mut AppState, previews: &PreviewLoader) {
+    while let Ok(event) = previews.try_recv() {
+        let current = matches!(
+            &app.preview,
+            PreviewState::Loading { request_id, path }
+                if *request_id == event.request_id && *path == event.path
+        );
+        if !current {
+            continue;
+        }
+        app.preview = match event.result {
+            Ok(document) => PreviewState::Ready(Box::new(PreviewSession::new(document))),
+            Err(message) => PreviewState::Failed {
+                request_id: event.request_id,
+                path: event.path,
+                message,
+            },
+        };
+    }
+}
+
+fn handle_preview_key(app: &mut AppState, previews: &PreviewLoader, key: KeyEvent) {
+    match &mut app.preview {
+        PreviewState::Closed => {}
+        PreviewState::Loading { .. } => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                previews.cancel();
+                app.preview = PreviewState::Closed;
+            }
+        }
+        PreviewState::Failed { path, .. } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.preview = PreviewState::Closed,
+            KeyCode::Char('r') => {
+                let path = path.clone();
+                let request_id = previews.request(path.clone());
+                app.preview = PreviewState::Loading { request_id, path };
+            }
+            _ => {}
+        },
+        PreviewState::Ready(session) => {
+            if session.help_visible {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1)
+                ) {
+                    session.help_visible = false;
+                }
+                return;
+            }
+            if session.search.editing {
+                handle_preview_search_key(session, key);
+                return;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.preview = PreviewState::Closed,
+                KeyCode::Char('/') => {
+                    session.search.editing = true;
+                    recompute_preview_search(session);
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    session.search.editing = true;
+                    recompute_preview_search(session);
+                }
+                KeyCode::Char('n') | KeyCode::F(3)
+                    if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    move_preview_match(session, 1)
+                }
+                KeyCode::Char('N') | KeyCode::F(3) => move_preview_match(session, -1),
+                KeyCode::Up | KeyCode::Char('k') => scroll_preview(session, -1),
+                KeyCode::Down | KeyCode::Char('j') => scroll_preview(session, 1),
+                KeyCode::PageUp => scroll_preview(session, -20),
+                KeyCode::PageDown => scroll_preview(session, 20),
+                KeyCode::Home | KeyCode::Char('g') => *session.active_scroll_mut() = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    let last = session.active_lines().len().saturating_sub(1);
+                    *session.active_scroll_mut() = last;
+                }
+                KeyCode::Left if !session.wrap => {
+                    session.horizontal_scroll = session.horizontal_scroll.saturating_sub(4)
+                }
+                KeyCode::Right if !session.wrap => {
+                    session.horizontal_scroll = session.horizontal_scroll.saturating_add(4)
+                }
+                KeyCode::Char('w') => session.wrap = !session.wrap,
+                KeyCode::Tab if session.mode == PreviewMode::Split => {
+                    session.active_region = match session.active_region {
+                        PreviewRegion::Raw => PreviewRegion::Formatted,
+                        PreviewRegion::Formatted => PreviewRegion::Raw,
+                    };
+                    session.search.matches.clear();
+                    session.search.current = None;
+                    recompute_preview_search(session);
+                }
+                KeyCode::Char('1') => set_preview_mode(session, PreviewMode::Raw),
+                KeyCode::Char('2') => set_preview_mode(session, PreviewMode::Split),
+                KeyCode::Char('3') => set_preview_mode(session, PreviewMode::Formatted),
+                KeyCode::Char('v') => cycle_preview_mode(session),
+                KeyCode::Char('r') => {
+                    let path = session.document.path.clone();
+                    let request_id = previews.request(path.clone());
+                    app.preview = PreviewState::Loading { request_id, path };
+                }
+                KeyCode::Char('?') | KeyCode::F(1) => session.help_visible = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+fn handle_preview_search_key(session: &mut PreviewSession, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => session.search.editing = false,
+        KeyCode::Enter => {
+            session.search.editing = false;
+            if session.search.current.is_none() && !session.search.matches.is_empty() {
+                session.search.current = Some(0);
+                jump_to_current_match(session);
+            }
+        }
+        KeyCode::Backspace => {
+            session.search.query.pop();
+            recompute_preview_search(session);
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            session.search.mode = match session.search.mode {
+                PreviewSearchMode::Literal => PreviewSearchMode::Regex,
+                PreviewSearchMode::Regex => PreviewSearchMode::Literal,
+            };
+            recompute_preview_search(session);
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+            session.search.case_sensitive = !session.search.case_sensitive;
+            recompute_preview_search(session);
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            session.search.query.push(character);
+            recompute_preview_search(session);
+        }
+        _ => {}
+    }
+}
+
+fn set_preview_mode(session: &mut PreviewSession, mode: PreviewMode) {
+    let supported = match mode {
+        PreviewMode::Raw => true,
+        PreviewMode::Split => {
+            session.document.kind == fileadmin_domain::PreviewKind::Markdown
+                && session.document.formatted_lines.is_some()
+        }
+        PreviewMode::Formatted => session.document.formatted_lines.is_some(),
+    };
+    if supported {
+        session.mode = mode;
+        session.active_region = if mode == PreviewMode::Raw {
+            PreviewRegion::Raw
+        } else {
+            PreviewRegion::Formatted
+        };
+        session.search.matches.clear();
+        session.search.current = None;
+        recompute_preview_search(session);
+    } else {
+        session.notice = Some("That representation is unavailable for this file".into());
+    }
+}
+
+fn cycle_preview_mode(session: &mut PreviewSession) {
+    let next = match (session.document.kind, session.mode) {
+        (fileadmin_domain::PreviewKind::Markdown, PreviewMode::Raw) => PreviewMode::Split,
+        (fileadmin_domain::PreviewKind::Markdown, PreviewMode::Split) => PreviewMode::Formatted,
+        (fileadmin_domain::PreviewKind::Markdown, PreviewMode::Formatted) => PreviewMode::Raw,
+        (fileadmin_domain::PreviewKind::Json, PreviewMode::Raw) => PreviewMode::Formatted,
+        (fileadmin_domain::PreviewKind::Json, _) => PreviewMode::Raw,
+        _ => PreviewMode::Raw,
+    };
+    set_preview_mode(session, next);
+}
+
+fn scroll_preview(session: &mut PreviewSession, delta: isize) {
+    let last = session.active_lines().len().saturating_sub(1);
+    let scroll = session.active_scroll_mut();
+    *scroll = scroll.saturating_add_signed(delta).min(last);
+}
+
+fn recompute_preview_search(session: &mut PreviewSession) {
+    const MAX_PATTERN_BYTES: usize = 1024;
+    const MAX_MATCHES: usize = 10_000;
+    let query = session.search.query.clone();
+    if query.is_empty() {
+        session.search.matches.clear();
+        session.search.current = None;
+        session.search.error = None;
+        return;
+    }
+    if query.len() > MAX_PATTERN_BYTES {
+        session.search.error = Some("Search pattern is limited to 1,024 bytes".into());
+        return;
+    }
+    let pattern = match session.search.mode {
+        PreviewSearchMode::Literal => regex::escape(&query),
+        PreviewSearchMode::Regex => query,
+    };
+    let expression = match RegexBuilder::new(&pattern)
+        .case_insensitive(!session.search.case_sensitive)
+        .multi_line(false)
+        .size_limit(2 * 1024 * 1024)
+        .dfa_size_limit(2 * 1024 * 1024)
+        .build()
+    {
+        Ok(expression) => expression,
+        Err(error) => {
+            session.search.error = Some(format!("Invalid search: {error}"));
+            return;
+        }
+    };
+    let lines = session.active_lines();
+    let mut matches = Vec::new();
+    'lines: for (line, text) in lines.into_iter().enumerate() {
+        for found in expression.find_iter(text) {
+            matches.push(PreviewMatch {
+                line,
+                start: found.start(),
+                end: found.end(),
+            });
+            if matches.len() == MAX_MATCHES {
+                session.notice = Some("Search stopped at the 10,000-match safety limit".into());
+                break 'lines;
+            }
+        }
+    }
+    session.search.matches = matches;
+    session.search.current = (!session.search.matches.is_empty()).then_some(0);
+    session.search.error = None;
+    jump_to_current_match(session);
+}
+
+fn move_preview_match(session: &mut PreviewSession, delta: isize) {
+    if session.search.matches.is_empty() {
+        session.notice = Some("No search matches".into());
+        return;
+    }
+    let length = session.search.matches.len();
+    let current = session.search.current.unwrap_or(0);
+    let wrapped;
+    let next = if delta < 0 {
+        if current == 0 {
+            wrapped = true;
+            length - 1
+        } else {
+            wrapped = false;
+            current - 1
+        }
+    } else {
+        wrapped = current + 1 >= length;
+        (current + 1) % length
+    };
+    session.search.current = Some(next);
+    session.notice = wrapped.then(|| {
+        if delta < 0 {
+            "Wrapped to end".into()
+        } else {
+            "Wrapped to start".into()
+        }
+    });
+    jump_to_current_match(session);
+}
+
+fn jump_to_current_match(session: &mut PreviewSession) {
+    let Some(index) = session.search.current else {
+        return;
+    };
+    let Some(found) = session.search.matches.get(index) else {
+        return;
+    };
+    let line = found.line;
+    *session.active_scroll_mut() = line.saturating_sub(2);
 }
 
 fn navigate_to(app: &mut AppState, scanner: &DirectoryScanner, target: PathBuf) {
@@ -642,4 +955,141 @@ fn install_terminal_panic_hook() {
         let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
         original(panic_info);
     }));
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use fileadmin_domain::{
+        FileEntry, PreviewCompleteness, PreviewDocument, PreviewEncoding, PreviewKind, PreviewLine,
+        PreviewLineStyle,
+    };
+
+    fn app_with_focused_file() -> AppState {
+        let root = PathBuf::from(r"C:\preview-route-test");
+        let mut app = AppState::new(root.clone(), root.clone());
+        let generation = app.active().generation;
+        app.active_mut().apply_entries(
+            generation,
+            vec![FileEntry {
+                path: root.join("Latest.log"),
+                display_name: "Latest.log".into(),
+                kind: EntryKind::File,
+                size: Some(20),
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
+        app
+    }
+
+    fn session(lines: &[&str]) -> PreviewSession {
+        PreviewSession::new(PreviewDocument {
+            request_id: 1,
+            path: PathBuf::from("test.log"),
+            file_size: 20,
+            modified: None,
+            kind: PreviewKind::Log,
+            encoding: PreviewEncoding::Utf8,
+            completeness: PreviewCompleteness::Complete,
+            raw_lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+            formatted_lines: None,
+            format_error: None,
+        })
+    }
+
+    #[test]
+    fn literal_search_is_case_insensitive_and_navigable() {
+        let mut session = session(&["Error one", "ok", "ERROR two"]);
+        session.search.query = "error".into();
+
+        recompute_preview_search(&mut session);
+        assert_eq!(session.search.matches.len(), 2);
+        assert_eq!(session.search.current, Some(0));
+
+        move_preview_match(&mut session, 1);
+        assert_eq!(session.search.current, Some(1));
+        assert_eq!(session.raw_scroll, 0);
+    }
+
+    #[test]
+    fn regex_search_reports_invalid_patterns_without_losing_valid_results() {
+        let mut session = session(&["item-12", "item-xx"]);
+        session.search.mode = PreviewSearchMode::Regex;
+        session.search.query = r"item-\d+".into();
+        recompute_preview_search(&mut session);
+        assert_eq!(session.search.matches.len(), 1);
+
+        session.search.query = "[".into();
+        recompute_preview_search(&mut session);
+        assert!(session.search.error.is_some());
+        assert_eq!(session.search.matches.len(), 1);
+    }
+
+    #[test]
+    fn markdown_modes_require_a_formatted_representation() {
+        let mut session = session(&["plain"]);
+        set_preview_mode(&mut session, PreviewMode::Split);
+        assert_eq!(session.mode, PreviewMode::Raw);
+
+        session.document.kind = PreviewKind::Markdown;
+        session.document.formatted_lines = Some(vec![PreviewLine {
+            text: "plain".into(),
+            style: PreviewLineStyle::Normal,
+        }]);
+        set_preview_mode(&mut session, PreviewMode::Split);
+        assert_eq!(session.mode, PreviewMode::Split);
+    }
+
+    #[test]
+    fn p_uppercase_p_and_enter_route_a_focused_file_to_preview() {
+        let scanner = DirectoryScanner::new();
+        let previews = PreviewLoader::new();
+        let operations = OperationEngine::new();
+        let mut app = app_with_focused_file();
+
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert!(matches!(app.preview, PreviewState::Loading { .. }));
+
+        previews.cancel();
+        app.preview = PreviewState::Closed;
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
+        assert!(matches!(app.preview, PreviewState::Loading { .. }));
+
+        previews.cancel();
+        app.preview = PreviewState::Closed;
+        handle_key(
+            &mut app,
+            &scanner,
+            &previews,
+            &operations,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(app.preview, PreviewState::Loading { .. }));
+    }
+
+    #[test]
+    fn search_navigation_announces_wrapping() {
+        let mut session = session(&["match", "match"]);
+        session.search.query = "match".into();
+        recompute_preview_search(&mut session);
+
+        move_preview_match(&mut session, -1);
+
+        assert_eq!(session.search.current, Some(1));
+        assert_eq!(session.notice.as_deref(), Some("Wrapped to end"));
+    }
 }

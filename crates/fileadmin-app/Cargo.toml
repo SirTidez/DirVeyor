@@ -13,5 +13,6 @@ fileadmin-domain = { path = "../fileadmin-domain" }
 fileadmin-engine = { path = "../fileadmin-engine" }
 fileadmin-fs = { path = "../fileadmin-fs" }
 ratatui.workspace = true
+regex.workspace = true
 time.workspace = true
 unicode-width.workspace = true

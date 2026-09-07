@@ -1,6 +1,7 @@
 use fileadmin_domain::{
     AppState, DriveInfo, DriveKind, EntryKind, FolderSizeState, JobOutcome, JobPhase, LoadState,
-    OperationKind, OperationView, PaneId, PaneState, PlanSummary, TextAction, TextPrompt,
+    OperationKind, OperationView, PaneId, PaneState, PlanSummary, PreviewLine, PreviewLineStyle,
+    PreviewMode, PreviewRegion, PreviewSession, PreviewState, TextAction, TextPrompt,
 };
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -19,6 +20,11 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
+        return;
+    }
+
+    if app.preview.is_open() {
+        render_preview(frame, area, &app.preview);
         return;
     }
 
@@ -76,6 +82,378 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     } else if !matches!(app.operation, OperationView::Idle) {
         render_operation(frame, area, &app.operation);
     }
+}
+
+fn render_preview(frame: &mut Frame, area: Rect, preview: &PreviewState) {
+    match preview {
+        PreviewState::Closed => {}
+        PreviewState::Loading { path, .. } => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Preview · {} ",
+                    safe_text(&path.to_string_lossy())
+                ))
+                .border_style(Style::default().fg(Color::Cyan));
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "\n\n{} Loading text preview…",
+                    folder_size_spinner()
+                ))
+                .block(block)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Cyan)),
+                area,
+            );
+        }
+        PreviewState::Failed { path, message, .. } => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Preview unavailable · {} ",
+                    safe_text(&path.to_string_lossy())
+                ))
+                .border_style(Style::default().fg(Color::Red));
+            let lines = vec![
+                Line::styled(
+                    "Preview could not be opened",
+                    Style::default().fg(Color::Red),
+                ),
+                Line::raw(""),
+                Line::raw(safe_text(message)),
+                Line::raw(""),
+                Line::styled("r Retry · Esc/q Back", Style::default().fg(Color::Cyan)),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
+        PreviewState::Ready(session) => render_preview_session(frame, area, session),
+    }
+}
+
+fn render_preview_session(frame: &mut Frame, area: Rect, session: &PreviewSession) {
+    let [header, content, status, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    let document = &session.document;
+    let name = document
+        .path
+        .file_name()
+        .map(|name| safe_text(&name.to_string_lossy()))
+        .unwrap_or_else(|| safe_text(&document.path.to_string_lossy()));
+    let header_text = format!(
+        " Preview · {name} · {} · {} · {} · {} · {} ",
+        document.kind.label(),
+        session.mode.label(document.kind),
+        document.encoding.label(),
+        human_size(document.file_size),
+        document.completeness.label()
+    );
+    frame.render_widget(
+        Paragraph::new(truncate(&header_text, header.width as usize)).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        header,
+    );
+
+    match session.mode {
+        PreviewMode::Raw => render_raw_preview(frame, content, session, false),
+        PreviewMode::Formatted => render_formatted_preview(frame, content, session, false),
+        PreviewMode::Split => {
+            let [raw, formatted] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(content);
+            render_raw_preview(frame, raw, session, true);
+            render_formatted_preview(frame, formatted, session, true);
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(preview_status(session)).style(Style::default().fg(Color::Yellow)),
+        status,
+    );
+    frame.render_widget(
+        Paragraph::new(truncate(&preview_footer(session), footer.width as usize))
+            .style(Style::default().fg(Color::Black).bg(Color::Gray)),
+        footer,
+    );
+
+    if session.help_visible {
+        render_preview_help(frame, area);
+    }
+}
+
+fn render_raw_preview(frame: &mut Frame, area: Rect, session: &PreviewSession, split: bool) {
+    let active = session.mode != PreviewMode::Split || session.active_region == PreviewRegion::Raw;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if split { " Raw " } else { " Text " })
+        .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let source = &session.document.raw_lines;
+    let end = (session.raw_scroll + inner.height as usize).min(source.len());
+    let number_width = source.len().max(1).to_string().len();
+    let lines = source[session.raw_scroll.min(source.len())..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, text)| {
+            preview_display_line(
+                session.raw_scroll + offset,
+                text,
+                PreviewLineStyle::Normal,
+                number_width,
+                session,
+                PreviewRegion::Raw,
+            )
+        })
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(lines);
+    let paragraph = if session.wrap {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    frame.render_widget(paragraph, inner);
+}
+
+fn render_formatted_preview(frame: &mut Frame, area: Rect, session: &PreviewSession, split: bool) {
+    let active =
+        session.mode != PreviewMode::Split || session.active_region == PreviewRegion::Formatted;
+    let title = if session.document.kind == fileadmin_domain::PreviewKind::Json {
+        " Pretty JSON "
+    } else {
+        " Rendered "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if split { title } else { " Preview " })
+        .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let fallback = vec![PreviewLine {
+        text: session
+            .document
+            .format_error
+            .clone()
+            .unwrap_or_else(|| "Formatted representation unavailable".into()),
+        style: PreviewLineStyle::Normal,
+    }];
+    let source = session
+        .document
+        .formatted_lines
+        .as_ref()
+        .unwrap_or(&fallback);
+    let lines = preview_visible_lines(
+        source,
+        session.formatted_scroll,
+        inner.height as usize,
+        session,
+        PreviewRegion::Formatted,
+    );
+    let paragraph = Paragraph::new(lines);
+    let paragraph = if session.wrap {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    frame.render_widget(paragraph, inner);
+}
+
+fn preview_visible_lines(
+    source: &[PreviewLine],
+    scroll: usize,
+    height: usize,
+    session: &PreviewSession,
+    region: PreviewRegion,
+) -> Vec<Line<'static>> {
+    let end = (scroll + height).min(source.len());
+    let number_width = source.len().max(1).to_string().len();
+    source[scroll.min(source.len())..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            preview_display_line(
+                scroll + offset,
+                &line.text,
+                line.style,
+                number_width,
+                session,
+                region,
+            )
+        })
+        .collect()
+}
+
+fn preview_display_line(
+    line_index: usize,
+    text: &str,
+    line_style: PreviewLineStyle,
+    number_width: usize,
+    session: &PreviewSession,
+    region: PreviewRegion,
+) -> Line<'static> {
+    let base = preview_line_style(line_style);
+    let horizontal = if session.wrap {
+        0
+    } else {
+        session.horizontal_scroll
+    };
+    let (visible, byte_offset) = skip_characters(text, horizontal);
+    let mut spans = vec![Span::styled(
+        format!("{:>number_width$} │ ", line_index + 1),
+        Style::default().fg(Color::DarkGray),
+    )];
+    let search_is_for_region =
+        session.mode != PreviewMode::Split || session.active_region == region;
+    if !search_is_for_region || session.search.matches.is_empty() {
+        spans.push(Span::styled(visible.to_owned(), base));
+        return Line::from(spans);
+    }
+    let mut cursor = byte_offset;
+    for (match_index, found) in session.search.matches.iter().enumerate() {
+        if found.line != line_index || found.end <= byte_offset {
+            continue;
+        }
+        let start = found.start.max(byte_offset).min(text.len());
+        let end = found.end.max(start).min(text.len());
+        if start > cursor {
+            spans.push(Span::styled(text[cursor..start].to_owned(), base));
+        }
+        let highlight = if session.search.current == Some(match_index) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::DarkGray)
+        };
+        spans.push(Span::styled(text[start..end].to_owned(), highlight));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        spans.push(Span::styled(text[cursor..].to_owned(), base));
+    }
+    Line::from(spans)
+}
+
+fn skip_characters(value: &str, count: usize) -> (&str, usize) {
+    let offset = value
+        .char_indices()
+        .nth(count)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    (&value[offset..], offset)
+}
+
+fn preview_line_style(style: PreviewLineStyle) -> Style {
+    match style {
+        PreviewLineStyle::Normal => Style::default(),
+        PreviewLineStyle::Heading => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        PreviewLineStyle::Quote => Style::default().fg(Color::LightBlue),
+        PreviewLineStyle::Code => Style::default().fg(Color::Green),
+        PreviewLineStyle::List => Style::default().fg(Color::White),
+        PreviewLineStyle::Rule => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn preview_status(session: &PreviewSession) -> String {
+    if session.search.editing {
+        let case = if session.search.case_sensitive {
+            "Case sensitive"
+        } else {
+            "Ignore case"
+        };
+        return format!(
+            " Find: {}_ · {} · {case} · Ctrl+r Mode · Alt+c Case",
+            safe_text(&session.search.query),
+            session.search.mode.label()
+        );
+    }
+    if let Some(error) = &session.search.error {
+        return safe_text(error);
+    }
+    if !session.search.query.is_empty() {
+        let position = session.search.current.map(|index| index + 1).unwrap_or(0);
+        let scope = if session.document.completeness.is_complete() {
+            ""
+        } else {
+            " · matches in loaded window"
+        };
+        let notice = session
+            .notice
+            .as_deref()
+            .map(|notice| format!(" · {}", safe_text(notice)))
+            .unwrap_or_default();
+        return format!(
+            " Find: {} · {position}/{}{}{}",
+            safe_text(&session.search.query),
+            session.search.matches.len(),
+            scope,
+            notice
+        );
+    }
+    session
+        .notice
+        .clone()
+        .or_else(|| session.document.format_error.clone())
+        .unwrap_or_else(|| safe_text(&session.document.path.to_string_lossy()))
+}
+
+fn preview_footer(session: &PreviewSession) -> String {
+    let modes = match session.document.kind {
+        fileadmin_domain::PreviewKind::Markdown => "1 Raw  2 Split  3 Preview  ",
+        fileadmin_domain::PreviewKind::Json if session.document.formatted_lines.is_some() => {
+            "1 Raw  3 Pretty  "
+        }
+        _ => "",
+    };
+    format!(
+        " Esc/q Back  ↑↓ Scroll  PgUp/PgDn  {modes}/ Find  n/N Match  w Wrap  r Reload  F1 Help"
+    )
+}
+
+fn render_preview_help(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(76, 76, area);
+    let lines = vec![
+        Line::styled(
+            "Full-screen Preview controls",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("Esc / q            Return to Browse"),
+        Line::raw("↑ ↓ / j k          Scroll"),
+        Line::raw("PageUp / PageDown  Scroll by page"),
+        Line::raw("Home/End / g/G     Start/end"),
+        Line::raw("← →                 Horizontal scroll"),
+        Line::raw("w                   Toggle wrapping"),
+        Line::raw("1 / 2 / 3           Raw / Split / Preview"),
+        Line::raw("Tab                 Focus split region"),
+        Line::raw("/ / Ctrl+f          Find"),
+        Line::raw("Ctrl+r in Find      Literal / Regex"),
+        Line::raw("Alt+c in Find       Toggle case matching"),
+        Line::raw("n / N / F3          Next / previous match"),
+        Line::raw("r                   Reload"),
+        Line::raw(""),
+        Line::styled("Esc / F1 Close help", Style::default().fg(Color::Cyan)),
+    ];
+    render_modal(frame, popup, " Preview help ", lines, Color::Cyan);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -294,10 +672,13 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
         },
         Line::raw(""),
         Line::styled(
-            "c Copy · m Move · d Recycle",
+            "p Preview · c Copy · m Move",
             Style::default().fg(Color::Cyan),
         ),
-        Line::styled("r Rename · n New folder", Style::default().fg(Color::Cyan)),
+        Line::styled(
+            "d Recycle · r Rename · n New folder",
+            Style::default().fg(Color::Cyan),
+        ),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -474,9 +855,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             app.active().filter
         )
     } else if area.width >= 110 {
-        " Tab Pane  ↑↓ Navigate  Space Select  c Copy  m Move  d Recycle  r Rename  n Folder  F1 Help".into()
+        " Tab Pane  ↑↓ Navigate  Enter Open  p Preview  c Copy  m Move  d Recycle  r Rename  n Folder  F1 Help".into()
     } else {
-        " Tab Pane  ↑↓ Move  Space Select  Enter Open  c Copy  m Move  d Recycle  F1 Help".into()
+        " Tab Pane  ↑↓ Move  Enter Open  p Preview  c Copy  m Move  d Recycle  F1 Help".into()
     };
     frame.render_widget(
         Paragraph::new(truncate(&text, area.width as usize))
@@ -499,7 +880,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw("↑ ↓ or j k         Move focus"),
         Line::raw("Home / End         First / last visible item"),
         Line::raw("Space              Toggle selection"),
-        Line::raw("Enter              Open folder or retry failed scan"),
+        Line::raw("Enter              Open folder or preview file"),
+        Line::raw("p                   Preview focused text file"),
         Line::raw("Backspace          Parent folder"),
         Line::raw("/                  Filter active pane"),
         Line::raw("h                  Toggle dotfiles"),
@@ -1322,5 +1704,59 @@ mod tests {
     fn modified_time_uses_a_human_readable_calendar_format() {
         let epoch = OffsetDateTime::from_unix_timestamp(0).unwrap();
         assert_eq!(format_datetime(epoch, " UTC"), "Jan 1, 1970 · 12:00 AM UTC");
+    }
+
+    #[test]
+    fn preview_replaces_the_complete_browse_layout() {
+        let mut app = populated_app();
+        app.preview = PreviewState::Ready(Box::new(PreviewSession::new(
+            fileadmin_domain::PreviewDocument {
+                request_id: 1,
+                path: PathBuf::from("Latest.log"),
+                file_size: 18,
+                modified: None,
+                kind: fileadmin_domain::PreviewKind::Log,
+                encoding: fileadmin_domain::PreviewEncoding::Utf8,
+                completeness: fileadmin_domain::PreviewCompleteness::Complete,
+                raw_lines: vec!["INFO ready".into(), "ERROR stopped".into()],
+                formatted_lines: None,
+                format_error: None,
+            },
+        )));
+
+        let screen = rendered_screen(&app, 120, 30);
+        assert!(screen.contains("Preview · Latest.log · Log · Raw · UTF-8"));
+        assert!(screen.contains("ERROR stopped"));
+        assert!(!screen.contains("Inspector"));
+        assert!(!screen.contains("example.txt"));
+    }
+
+    #[test]
+    fn markdown_split_renders_raw_and_preview_regions() {
+        let mut app = populated_app();
+        let document = fileadmin_domain::PreviewDocument {
+            request_id: 2,
+            path: PathBuf::from("README.md"),
+            file_size: 12,
+            modified: None,
+            kind: fileadmin_domain::PreviewKind::Markdown,
+            encoding: fileadmin_domain::PreviewEncoding::Utf8,
+            completeness: fileadmin_domain::PreviewCompleteness::Complete,
+            raw_lines: vec!["# Heading".into()],
+            formatted_lines: Some(vec![PreviewLine {
+                text: "Heading".into(),
+                style: PreviewLineStyle::Heading,
+            }]),
+            format_error: None,
+        };
+        let mut session = PreviewSession::new(document);
+        session.mode = PreviewMode::Split;
+        app.preview = PreviewState::Ready(Box::new(session));
+
+        let screen = rendered_screen(&app, 120, 30);
+        assert!(screen.contains("Raw"));
+        assert!(screen.contains("Rendered"));
+        assert!(screen.contains("# Heading"));
+        assert!(screen.contains("Heading"));
     }
 }
