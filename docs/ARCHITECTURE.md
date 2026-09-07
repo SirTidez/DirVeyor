@@ -142,7 +142,7 @@ Windows hidden attributes are not yet considered.
    pass. The resulting exact files, folders, and bytes are reviewed without
    retaining an in-memory item manifest. Execution traverses the tree again and
    streams work through its bounded queue. Permanent delete freezes an exact
-   manifest during planning. Recycle keeps
+   on-disk manifest during planning. Recycle keeps
    selected-root scope so an inaccessible descendant cannot block the operating
    system's Recycle Bin / Trash facility.
 3. The user either presses `Esc` to abandon the plan or `Enter` to approve it.
@@ -151,8 +151,9 @@ Windows hidden attributes are not yet considered.
    reports bounded progress. Transfer discovery feeds a bounded queue while one
    same-volume or two cross-volume workers copy independent files. A conflict
    pauses the discovery producer, but workers can finish already queued files.
-   Permanent delete removes manifest files one at a time and directories
-   deepest-first, exposing completed bytes and separate file/folder counts.
+   Permanent delete reads its bounded-memory on-disk manifest twice: files are
+   removed on the first pass, then postordered directories child-before-parent
+   on the second. It exposes completed bytes and separate file/folder counts.
    Cancellation stops before the next safe step.
 5. The UI displays a durable outcome and refreshes affected visible panes.
 
@@ -166,7 +167,9 @@ Windows hidden attributes are not yet considered.
   revalidated before replacement.
 - Failed Recycle Bin / Trash operations never fall back to permanent deletion.
 - Permanent deletion is a separate, visibly red mode selected with `Ctrl+D`;
-  directory failures may be partial and are reported as such.
+  directory failures may be partial and are reported as such. Its anonymous
+  temporary manifest removes the former discovered-entry cap without retaining
+  the tree in memory.
 - Cross-volume move sources remain until the streamed copy pass completes.
   Verified source identities are stored in a temporary binary on-disk journal;
   cleanup revalidates every journal entry before removal.

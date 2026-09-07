@@ -187,10 +187,11 @@ when the other pane is active. Pane titles show `SOURCE` and `DESTINATION` with
 an arrow indicating travel direction. If both panes have selections, the active
 pane is the source.
 
-Directories are discovered and transferred incrementally, so million-entry jobs
-do not require a complete in-memory plan. Until discovery finishes, progress is
-indeterminate and reports completed entries, discovered entries, bytes, and the
-current path; it does not invent a final percentage.
+Directories receive a metadata-only count before review, so million-entry jobs
+do not require a complete in-memory plan. The planning dialog reports discovered
+entries, bytes, and the current path. Once approved, the transfer starts with the
+reviewed totals and a determinate progress bar while execution traverses the tree
+again through its bounded queue.
 
 For file/file conflicts, FileAdmin displays both full paths, sizes, readable
 modified times, and explicitly identifies the newer side. The choices are Keep
@@ -255,8 +256,9 @@ cargo build --release --workspace
   verified sources on disk, and only then remove those sources.
 - Filesystem roots, overlapping selections, links, junctions, reparse points,
   special files, and self-descendant transfers are rejected.
-- A plan is capped at 1,000 top-level selections. The 100,000-entry manifest
-  safety limit applies to permanent deletion, not copy or move. Recycle plans
+- A plan is capped at 1,000 top-level selections. Copy, move, and permanent
+  deletion have no discovered-entry ceiling. Permanent deletion freezes its
+  reviewed scope in an anonymous temporary on-disk manifest, while Recycle plans
   remain selected-root scoped.
 - Capacity preflight, pause/resume, persistent queues, undo, and link-aware
   operations are not implemented yet.

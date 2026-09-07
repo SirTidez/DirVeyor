@@ -179,11 +179,12 @@ Intent -> Plan -> Scan -> Review if needed -> Queue -> Transfer
   conflicts detectable up front, capacity estimates, and recovery options.
 - **Scan** enumerates enough work to present scope; very large trees may stream
   additional discoveries while clearly showing that totals are still growing.
-- **Permanent-delete scan** freezes a complete readable manifest and streams
-  discovered file, folder, and byte counts before review. **Recycle scan** may
-  snapshot only selected roots and label recursive totals as unknown when
-  enumeration would prevent the platform API from handling an otherwise
-  removable directory.
+- **Permanent-delete scan** freezes a complete readable manifest in anonymous
+  temporary storage and streams discovered file, folder, and byte counts before
+  review. It must not impose an arbitrary entry ceiling or retain the tree in
+  memory. **Recycle scan** may snapshot only selected roots and label recursive
+  totals as unknown when enumeration would prevent the platform API from
+  handling an otherwise removable directory.
 - **Review** is mandatory for destructive or ambiguous plans.
 - **Transfer** emits monotonic byte and item counters from actual completed I/O.
 - **Conflict** identifies source and destination versions, supports keep newer,
@@ -286,7 +287,7 @@ not perform filesystem work directly. Workers never write terminal state.
 
 - Input-to-visible-response p95 below 50 ms while transfers are active.
 - No unbounded channel, task, worker, selection list, or in-memory directory
-  snapshot.
+  snapshot. Large destructive manifests spill to temporary storage.
 - Render loop should redraw on meaningful state change, resize, or a modest
   animation tick—not continuously at maximum rate.
 - First directory entries visible within 150 ms for ordinary local folders;
