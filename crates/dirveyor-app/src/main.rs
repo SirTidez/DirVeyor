@@ -5,18 +5,18 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fileadmin_domain::{
+use dirveyor_domain::{
     AppState, DeleteMode, EntryKind, FavoritesPanel, FileEntry, FolderSizeProgress,
     FolderSizeState, LoadState, PaneId, PreviewMatch, PreviewMode, PreviewRegion,
     PreviewSearchMode, PreviewSession, PreviewState, PreviewWindowDirection, parent_or_same,
     paths_match,
 };
-use fileadmin_domain::{
+use dirveyor_domain::{
     ConflictAction, ConflictKind, ConflictPrompt, JobId, JobOutcome, OperationIntent,
     OperationKind, OperationPlanningProgress, OperationView, TextAction, TextPrompt,
 };
-use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
-use fileadmin_fs::{
+use dirveyor_engine::{OperationEngine, OperationEvent, SubmitError};
+use dirveyor_fs::{
     DirectoryScanner, FavoritesStore, FolderSizeScanner, FolderSizeUpdate, MAX_FAVORITES,
     PreviewLoader, PreviewWindowTarget, RequestError, ScanLocation, ScanRequest,
     user_home_directory,
@@ -656,7 +656,7 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
             ) {
                 operations.cancel();
                 let mut progress = progress.clone();
-                progress.phase = fileadmin_domain::JobPhase::Cancelling;
+                progress.phase = dirveyor_domain::JobPhase::Cancelling;
                 app.operation = OperationView::Running(progress);
                 app.notice = Some("Cancellation requested; finishing the current safe step".into());
             }
@@ -714,9 +714,9 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
                     .iter()
                     .any(|failure| elevation_available(&failure.message))
             {
-                app.notice = Some(match launch_elevated_fileadmin(app) {
+                app.notice = Some(match launch_elevated_dirveyor(app) {
                     Ok(()) => {
-                        "Opened an elevated FileAdmin at the same locations; approve the UAC prompt"
+                        "Opened an elevated DirVeyor at the same locations; approve the UAC prompt"
                             .into()
                     }
                     Err(error) => error,
@@ -727,9 +727,9 @@ fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: K
         }
         OperationView::Error { kind, message, .. } => {
             if is_elevation_shortcut(key) && kind.is_delete() && elevation_available(&message) {
-                app.notice = Some(match launch_elevated_fileadmin(app) {
+                app.notice = Some(match launch_elevated_dirveyor(app) {
                     Ok(()) => {
-                        "Opened an elevated FileAdmin at the same locations; approve the UAC prompt"
+                        "Opened an elevated DirVeyor at the same locations; approve the UAC prompt"
                             .into()
                     }
                     Err(error) => error,
@@ -966,7 +966,7 @@ fn is_process_elevated() -> bool {
 }
 
 #[cfg(windows)]
-fn launch_elevated_fileadmin(app: &AppState) -> Result<(), String> {
+fn launch_elevated_dirveyor(app: &AppState) -> Result<(), String> {
     use std::ffi::{OsStr, OsString};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
@@ -974,7 +974,7 @@ fn launch_elevated_fileadmin(app: &AppState) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not locate FileAdmin executable — {error}"))?;
+        .map_err(|error| format!("Could not locate DirVeyor executable — {error}"))?;
     let mut arguments = Vec::<OsString>::new();
     for pane_id in PaneId::ALL {
         let pane = app.pane(pane_id);
@@ -1019,7 +1019,7 @@ fn launch_elevated_fileadmin(app: &AppState) -> Result<(), String> {
     // SAFETY: all pointers reference valid NUL-terminated UTF-16 buffers for
     // the duration of ShellExecuteW. No window handle or working directory is
     // supplied. The elevated child performs no automatic operation; it merely
-    // reopens FileAdmin at the current locations for a fresh reviewed attempt.
+    // reopens DirVeyor at the current locations for a fresh reviewed attempt.
     let result = unsafe {
         ShellExecuteW(
             ptr::null_mut(),
@@ -1034,7 +1034,7 @@ fn launch_elevated_fileadmin(app: &AppState) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Windows did not launch elevated FileAdmin (ShellExecute code {})",
+            "Windows did not launch elevated DirVeyor (ShellExecute code {})",
             result as isize
         ))
     }
@@ -1072,7 +1072,7 @@ fn windows_command_line(arguments: &[std::ffi::OsString]) -> Vec<u16> {
 }
 
 #[cfg(not(windows))]
-fn launch_elevated_fileadmin(_app: &AppState) -> Result<(), String> {
+fn launch_elevated_dirveyor(_app: &AppState) -> Result<(), String> {
     Err("In-app elevation is currently available only on Windows".into())
 }
 
@@ -1224,7 +1224,7 @@ fn drain_preview_change_events(app: &mut AppState, previews: &PreviewLoader) {
 
 fn session_for_new_window(
     previous: PreviewSession,
-    document: fileadmin_domain::PreviewDocument,
+    document: dirveyor_domain::PreviewDocument,
     direction: PreviewWindowDirection,
 ) -> PreviewSession {
     let mut session = PreviewSession::new(document);
@@ -1489,7 +1489,7 @@ fn set_preview_mode(session: &mut PreviewSession, mode: PreviewMode) {
     let supported = match mode {
         PreviewMode::Raw => true,
         PreviewMode::Split => {
-            session.document.kind == fileadmin_domain::PreviewKind::Markdown
+            session.document.kind == dirveyor_domain::PreviewKind::Markdown
                 && session.document.formatted_lines.is_some()
         }
         PreviewMode::Formatted => session.document.formatted_lines.is_some(),
@@ -1511,11 +1511,11 @@ fn set_preview_mode(session: &mut PreviewSession, mode: PreviewMode) {
 
 fn cycle_preview_mode(session: &mut PreviewSession) {
     let next = match (session.document.kind, session.mode) {
-        (fileadmin_domain::PreviewKind::Markdown, PreviewMode::Raw) => PreviewMode::Split,
-        (fileadmin_domain::PreviewKind::Markdown, PreviewMode::Split) => PreviewMode::Formatted,
-        (fileadmin_domain::PreviewKind::Markdown, PreviewMode::Formatted) => PreviewMode::Raw,
-        (fileadmin_domain::PreviewKind::Json, PreviewMode::Raw) => PreviewMode::Formatted,
-        (fileadmin_domain::PreviewKind::Json, _) => PreviewMode::Raw,
+        (dirveyor_domain::PreviewKind::Markdown, PreviewMode::Raw) => PreviewMode::Split,
+        (dirveyor_domain::PreviewKind::Markdown, PreviewMode::Split) => PreviewMode::Formatted,
+        (dirveyor_domain::PreviewKind::Markdown, PreviewMode::Formatted) => PreviewMode::Raw,
+        (dirveyor_domain::PreviewKind::Json, PreviewMode::Raw) => PreviewMode::Formatted,
+        (dirveyor_domain::PreviewKind::Json, _) => PreviewMode::Raw,
         _ => PreviewMode::Raw,
     };
     set_preview_mode(session, next);
@@ -1744,7 +1744,7 @@ fn install_terminal_panic_hook() {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
-    use fileadmin_domain::{
+    use dirveyor_domain::{
         FileEntry, JobId, PlanSummary, PlannedStrategy, PreviewCompleteness, PreviewDocument,
         PreviewEncoding, PreviewKind, PreviewLine, PreviewLineStyle,
     };

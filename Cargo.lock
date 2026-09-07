@@ -231,6 +231,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirveyor"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "dirveyor-domain",
+ "dirveyor-engine",
+ "dirveyor-fs",
+ "ratatui",
+ "regex",
+ "tempfile",
+ "time",
+ "unicode-width",
+ "windows-sys",
+]
+
+[[package]]
+name = "dirveyor-domain"
+version = "0.1.0"
+
+[[package]]
+name = "dirveyor-engine"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "dirveyor-domain",
+ "sha2",
+ "tempfile",
+ "trash",
+ "windows-sys",
+]
+
+[[package]]
+name = "dirveyor-fs"
+version = "0.1.0"
+dependencies = [
+ "dirveyor-domain",
+ "pulldown-cmark",
+ "serde_json",
+ "tempfile",
+ "windows-sys",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -266,49 +309,6 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-
-[[package]]
-name = "fileadmin"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "fileadmin-domain",
- "fileadmin-engine",
- "fileadmin-fs",
- "ratatui",
- "regex",
- "tempfile",
- "time",
- "unicode-width",
- "windows-sys",
-]
-
-[[package]]
-name = "fileadmin-domain"
-version = "0.1.0"
-
-[[package]]
-name = "fileadmin-engine"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "fileadmin-domain",
- "sha2",
- "tempfile",
- "trash",
- "windows-sys",
-]
-
-[[package]]
-name = "fileadmin-fs"
-version = "0.1.0"
-dependencies = [
- "fileadmin-domain",
- "pulldown-cmark",
- "serde_json",
- "tempfile",
- "windows-sys",
-]
 
 [[package]]
 name = "foldhash"

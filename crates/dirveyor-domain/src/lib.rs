@@ -1,4 +1,4 @@
-//! Pure state used by the FileAdmin UI and filesystem adapters.
+//! Pure state used by the DirVeyor UI and filesystem adapters.
 
 mod operation;
 mod preview;

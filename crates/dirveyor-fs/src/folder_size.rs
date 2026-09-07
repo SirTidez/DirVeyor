@@ -1,4 +1,4 @@
-use fileadmin_domain::{FolderSizeProgress, FolderSizeSummary, PaneId};
+use dirveyor_domain::{FolderSizeProgress, FolderSizeSummary, PaneId};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ impl FolderSizeScanner {
         let worker_pending = Arc::clone(&pending);
         let worker_current = Arc::clone(&current_request);
         thread::Builder::new()
-            .name("fileadmin-folder-size".into())
+            .name("dirveyor-folder-size".into())
             .spawn(move || folder_size_worker(worker_pending, result_tx, worker_current))
             .expect("failed to start folder size scanner");
 

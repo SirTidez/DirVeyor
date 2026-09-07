@@ -1,4 +1,4 @@
-use fileadmin_domain::{
+use dirveyor_domain::{
     PreviewCompleteness, PreviewDocument, PreviewEncoding, PreviewKind, PreviewLine,
     PreviewLineStyle,
 };
@@ -70,14 +70,14 @@ impl PreviewLoader {
         let worker_pending = Arc::clone(&pending);
         let worker_current = Arc::clone(&current_request);
         thread::Builder::new()
-            .name("fileadmin-preview".into())
+            .name("dirveyor-preview".into())
             .spawn(move || preview_worker(worker_pending, result_tx, worker_current))
             .expect("failed to start preview reader");
         let watch = Arc::new((Mutex::new(None), Condvar::new()));
         let worker_watch = Arc::clone(&watch);
         let (change_tx, change_rx) = mpsc::sync_channel(1);
         thread::Builder::new()
-            .name("fileadmin-preview-watch".into())
+            .name("dirveyor-preview-watch".into())
             .spawn(move || preview_watch_worker(worker_watch, change_tx))
             .expect("failed to start preview change watcher");
         Self {

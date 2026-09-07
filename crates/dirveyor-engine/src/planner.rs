@@ -1,4 +1,4 @@
-use fileadmin_domain::{
+use dirveyor_domain::{
     JobId, OperationIntent, OperationKind, OperationPlanningProgress, PlanSummary, PlannedStrategy,
 };
 use std::collections::HashSet;
@@ -44,7 +44,7 @@ pub(crate) enum PlannedAction {
         roots: Vec<TransferRoot>,
         remove_sources: bool,
         worker_count: usize,
-        verification: fileadmin_domain::VerificationMode,
+        verification: dirveyor_domain::VerificationMode,
     },
     AtomicMove {
         roots: Vec<TransferRoot>,
@@ -147,7 +147,7 @@ fn build_transfer(
     sources: Vec<PathBuf>,
     destination: PathBuf,
     cancelled: &AtomicBool,
-    verification: fileadmin_domain::VerificationMode,
+    verification: dirveyor_domain::VerificationMode,
     progress: &mut dyn FnMut(OperationPlanningProgress),
 ) -> Result<OperationPlan, String> {
     check_cancelled(cancelled)?;
@@ -1161,7 +1161,7 @@ mod tests {
         let intent = OperationIntent::Copy {
             sources: vec![PathBuf::from("missing-source")],
             destination: PathBuf::from("missing-destination"),
-            verification: fileadmin_domain::VerificationMode::Full,
+            verification: dirveyor_domain::VerificationMode::Full,
         };
 
         let error = build_plan(JobId(1), intent, &cancelled).unwrap_err();
@@ -1222,7 +1222,7 @@ mod tests {
             OperationIntent::Copy {
                 sources: vec![root],
                 destination: destination.path().to_path_buf(),
-                verification: fileadmin_domain::VerificationMode::Full,
+                verification: dirveyor_domain::VerificationMode::Full,
             },
             &cancelled,
             &mut |update| last_progress = Some(update),
@@ -1257,7 +1257,7 @@ mod tests {
             OperationIntent::Move {
                 sources: vec![source],
                 destination: parent.path().to_path_buf(),
-                verification: fileadmin_domain::VerificationMode::Full,
+                verification: dirveyor_domain::VerificationMode::Full,
             },
             &cancelled,
         )
@@ -1306,7 +1306,7 @@ mod tests {
             OperationIntent::Copy {
                 sources: vec![first, second],
                 destination: destination.path().to_path_buf(),
-                verification: fileadmin_domain::VerificationMode::Full,
+                verification: dirveyor_domain::VerificationMode::Full,
             },
             &cancelled,
         )

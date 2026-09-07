@@ -1,6 +1,6 @@
 [package]
-name = "fileadmin-engine"
-description = "Reviewed, bounded filesystem operation planner and executor for FileAdmin"
+name = "dirveyor-engine"
+description = "Reviewed, bounded filesystem operation planner and executor for DirVeyor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
-fileadmin-domain = { path = "../fileadmin-domain" }
+dirveyor-domain = { path = "../dirveyor-domain" }
 sha2.workspace = true
 tempfile.workspace = true
 trash.workspace = true

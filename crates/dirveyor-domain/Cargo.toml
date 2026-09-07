@@ -1,6 +1,6 @@
 [package]
-name = "fileadmin-domain"
-description = "Pure application state and commands for FileAdmin"
+name = "dirveyor-domain"
+description = "Pure application state and commands for DirVeyor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

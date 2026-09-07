@@ -4,7 +4,7 @@ use crate::planner::{
 };
 use crate::{ConflictResolution, OperationEvent};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender};
-use fileadmin_domain::{
+use dirveyor_domain::{
     ConflictAction, ConflictKind, JobOutcome, JobPhase, OperationFailure, OperationProgress,
     OperationReport, TransferConflict, VerificationMode, VersionRelation,
 };
@@ -200,7 +200,7 @@ fn execute_transfer(
     roots: &[TransferRoot],
     remove_sources: bool,
     worker_count: usize,
-    verification: fileadmin_domain::VerificationMode,
+    verification: dirveyor_domain::VerificationMode,
     events: &Sender<OperationEvent>,
     conflict_resolutions: &Receiver<ConflictResolution>,
     cancel_requested: &Arc<AtomicBool>,

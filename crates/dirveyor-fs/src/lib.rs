@@ -8,7 +8,7 @@ pub use favorites::{FavoritesStore, MAX_FAVORITES, user_home_directory};
 pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner, FolderSizeUpdate};
 pub use preview::{PreviewChangeEvent, PreviewEvent, PreviewLoader, PreviewWindowTarget};
 
-use fileadmin_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
+use dirveyor_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -107,7 +107,7 @@ impl DirectoryScanner {
             let requests = Arc::clone(&shared_requests);
             let results = result_tx.clone();
             thread::Builder::new()
-                .name(format!("fileadmin-scan-{worker_number}"))
+                .name(format!("dirveyor-scan-{worker_number}"))
                 .spawn(move || worker_loop(requests, results))
                 .expect("failed to start directory scanner");
         }

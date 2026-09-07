@@ -1,4 +1,4 @@
-//! Reviewed filesystem operations for FileAdmin.
+//! Reviewed filesystem operations for DirVeyor.
 //!
 //! Submitting an intent can only produce a reviewable plan. Its job id must be
 //! approved before any filesystem mutation is attempted.
@@ -7,7 +7,7 @@ mod executor;
 mod planner;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
-use fileadmin_domain::{
+use dirveyor_domain::{
     ConflictAction, JobId, OperationIntent, OperationPlanningProgress, OperationProgress,
     OperationReport, PlanSummary, TransferConflict,
 };
@@ -27,7 +27,7 @@ pub enum OperationEvent {
     Finished(OperationReport),
     Failed {
         job: Option<JobId>,
-        kind: fileadmin_domain::OperationKind,
+        kind: dirveyor_domain::OperationKind,
         message: String,
     },
 }
@@ -70,7 +70,7 @@ impl OperationEngine {
         let worker_busy = Arc::clone(&busy);
         let worker_cancel = Arc::clone(&cancel_requested);
         thread::Builder::new()
-            .name("fileadmin-operation-coordinator".into())
+            .name("dirveyor-operation-coordinator".into())
             .spawn(move || {
                 coordinator(
                     command_rx,

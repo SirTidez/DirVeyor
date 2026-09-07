@@ -9,21 +9,37 @@ const MAX_FAVORITES_FILE_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct FavoritesStore {
     path: Option<PathBuf>,
+    legacy_path: Option<PathBuf>,
 }
 
 impl FavoritesStore {
     pub fn discover() -> Self {
         Self {
             path: configuration_root().map(|root| root.join("favorites.json")),
+            legacy_path: legacy_configuration_root().map(|root| root.join("favorites.json")),
         }
     }
 
     pub fn from_path(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+        Self {
+            path: Some(path),
+            legacy_path: None,
+        }
     }
 
     pub fn load(&self) -> Result<Vec<PathBuf>, String> {
         let Some(path) = &self.path else {
+            return Ok(Vec::new());
+        };
+        let path = if path.exists() {
+            path
+        } else if let Some(legacy_path) = self
+            .legacy_path
+            .as_ref()
+            .filter(|legacy_path| legacy_path.exists())
+        {
+            legacy_path
+        } else {
             return Ok(Vec::new());
         };
         if path
@@ -100,6 +116,23 @@ fn configuration_root() -> Option<PathBuf> {
         env::var_os("APPDATA")
             .or_else(|| env::var_os("LOCALAPPDATA"))
             .map(PathBuf::from)
+            .map(|root| root.join("DirVeyor"))
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| user_home_directory().map(|home| home.join(".config")))
+            .map(|root| root.join("dirveyor"))
+    }
+}
+
+fn legacy_configuration_root() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env::var_os("APPDATA")
+            .or_else(|| env::var_os("LOCALAPPDATA"))
+            .map(PathBuf::from)
             .map(|root| root.join("FileAdmin"))
     }
     #[cfg(not(windows))]
@@ -162,5 +195,25 @@ mod tests {
             deduplicate(paths),
             vec![PathBuf::from("alpha"), PathBuf::from("beta")]
         );
+    }
+
+    #[test]
+    fn legacy_store_is_used_only_when_the_new_store_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_path = temp.path().join("DirVeyor").join("favorites.json");
+        let legacy_path = temp.path().join("FileAdmin").join("favorites.json");
+        let legacy_store = FavoritesStore::from_path(legacy_path.clone());
+        legacy_store.save(&[PathBuf::from("legacy")]).unwrap();
+
+        let store = FavoritesStore {
+            path: Some(current_path.clone()),
+            legacy_path: Some(legacy_path),
+        };
+        assert_eq!(store.load().unwrap(), vec![PathBuf::from("legacy")]);
+
+        FavoritesStore::from_path(current_path)
+            .save(&[PathBuf::from("current")])
+            .unwrap();
+        assert_eq!(store.load().unwrap(), vec![PathBuf::from("current")]);
     }
 }

@@ -1,4 +1,4 @@
-use fileadmin_domain::{
+use dirveyor_domain::{
     AppState, ConflictKind, ConflictPrompt, DriveInfo, DriveKind, EntryKind, FolderSizeState,
     JobOutcome, JobPhase, LoadState, OperationKind, OperationView, PaneId, PaneState, PlanSummary,
     PreviewLine, PreviewLineStyle, PreviewMode, PreviewRegion, PreviewSession, PreviewState,
@@ -256,7 +256,7 @@ fn render_raw_preview(frame: &mut Frame, area: Rect, session: &PreviewSession, s
 fn render_formatted_preview(frame: &mut Frame, area: Rect, session: &PreviewSession, split: bool) {
     let active =
         session.mode != PreviewMode::Split || session.active_region == PreviewRegion::Formatted;
-    let title = if session.document.kind == fileadmin_domain::PreviewKind::Json {
+    let title = if session.document.kind == dirveyor_domain::PreviewKind::Json {
         " Pretty JSON "
     } else {
         " Rendered "
@@ -454,8 +454,8 @@ fn preview_status(session: &PreviewSession) -> String {
 
 fn preview_footer(session: &PreviewSession) -> String {
     let modes = match session.document.kind {
-        fileadmin_domain::PreviewKind::Markdown => "1 Raw  2 Split  3 Preview  ",
-        fileadmin_domain::PreviewKind::Json if session.document.formatted_lines.is_some() => {
+        dirveyor_domain::PreviewKind::Markdown => "1 Raw  2 Split  3 Preview  ",
+        dirveyor_domain::PreviewKind::Json if session.document.formatted_lines.is_some() => {
             "1 Raw  3 Pretty  "
         }
         _ => "",
@@ -519,7 +519,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
         .unwrap_or("Ready");
     let line = Line::from(vec![
         Span::styled(
-            " FileAdmin ",
+            " DirVeyor ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -814,8 +814,8 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
         lines.push(Line::raw("No item focused"));
     }
     let delete_action = match app.delete_mode {
-        fileadmin_domain::DeleteMode::Recycle => "D Recycle · Ctrl+D Change mode",
-        fileadmin_domain::DeleteMode::Permanent => "D DELETE · Ctrl+D Change mode",
+        dirveyor_domain::DeleteMode::Recycle => "D Recycle · Ctrl+D Change mode",
+        dirveyor_domain::DeleteMode::Permanent => "D DELETE · Ctrl+D Change mode",
     };
     lines.extend([
         Line::raw(""),
@@ -1032,8 +1032,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
         format!(
             " Tab Pane  ↑↓ Move  ← Back  → Open/Select  Enter Open/Preview  C Copy  M Move  D {}  Ctrl+D Mode  F1 Help",
             match app.delete_mode {
-                fileadmin_domain::DeleteMode::Recycle => "Recycle",
-                fileadmin_domain::DeleteMode::Permanent => "DELETE",
+                dirveyor_domain::DeleteMode::Recycle => "Recycle",
+                dirveyor_domain::DeleteMode::Permanent => "DELETE",
             }
         )
     } else {
@@ -1050,7 +1050,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(72, 92, area);
     let lines = vec![
         Line::styled(
-            "FileAdmin controls",
+            "DirVeyor controls",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1315,7 +1315,7 @@ fn render_conflict(frame: &mut Frame, area: Rect, prompt: &ConflictPrompt) {
 fn render_planning(
     frame: &mut Frame,
     area: Rect,
-    progress: &fileadmin_domain::OperationPlanningProgress,
+    progress: &dirveyor_domain::OperationPlanningProgress,
 ) {
     let popup = centered_rect(74, 28, area);
     let mut lines = vec![
@@ -1480,7 +1480,7 @@ fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary) {
     );
 }
 
-fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::OperationProgress) {
+fn render_running(frame: &mut Frame, area: Rect, progress: &dirveyor_domain::OperationProgress) {
     let popup = centered_rect(78, 42, area);
     let percent = if !progress.scope_complete {
         None
@@ -1579,7 +1579,7 @@ fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::Op
     render_modal(frame, popup, " Operation in progress ", lines, Color::Cyan);
 }
 
-fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::OperationReport) {
+fn render_finished(frame: &mut Frame, area: Rect, report: &dirveyor_domain::OperationReport) {
     let popup = centered_rect(78, 58, area);
     let color = match report.outcome {
         JobOutcome::Completed => Color::Green,
@@ -1638,7 +1638,7 @@ fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::Ope
         {
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "Ctrl+E Open elevated FileAdmin for a new reviewed attempt",
+                "Ctrl+E Open elevated DirVeyor for a new reviewed attempt",
                 Style::default().fg(Color::Yellow),
             ));
         } else if cfg!(windows)
@@ -1680,7 +1680,7 @@ fn render_operation_error(frame: &mut Frame, area: Rect, kind: OperationKind, me
     ];
     if kind.is_delete() && super::elevation_available(message) {
         lines.push(Line::styled(
-            "Ctrl+E Open elevated FileAdmin for a new reviewed attempt",
+            "Ctrl+E Open elevated DirVeyor for a new reviewed attempt",
             Style::default().fg(Color::Yellow),
         ));
     } else if cfg!(windows)
@@ -1747,7 +1747,7 @@ fn outcome_label(outcome: JobOutcome) -> &'static str {
     }
 }
 
-fn progress_status(progress: &fileadmin_domain::OperationProgress) -> String {
+fn progress_status(progress: &dirveyor_domain::OperationProgress) -> String {
     let percent = if !progress.scope_complete {
         None
     } else if progress.kind.is_delete() {
@@ -1790,7 +1790,7 @@ fn progress_bar(percent: u8, width: usize) -> String {
 
 fn render_too_small(frame: &mut Frame, area: Rect) {
     let text = format!(
-        "FileAdmin needs at least {MIN_WIDTH}×{MIN_HEIGHT}\nCurrent terminal: {}×{}\n\nResize the terminal to continue.",
+        "DirVeyor needs at least {MIN_WIDTH}×{MIN_HEIGHT}\nCurrent terminal: {}×{}\n\nResize the terminal to continue.",
         area.width, area.height
     );
     frame.render_widget(
@@ -1951,7 +1951,7 @@ fn month_label(month: time::Month) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fileadmin_domain::{
+    use dirveyor_domain::{
         FileEntry, JobId, LoadState, OperationPlanningProgress, OperationProgress, PlannedStrategy,
     };
     use ratatui::Terminal;
@@ -2033,7 +2033,7 @@ mod tests {
     fn file_conflict_declares_versions_and_all_six_choices() {
         let mut app = populated_app();
         app.operation = OperationView::Conflict(ConflictPrompt {
-            conflict: fileadmin_domain::TransferConflict {
+            conflict: dirveyor_domain::TransferConflict {
                 job: JobId(44),
                 kind: ConflictKind::FileToFile,
                 source: PathBuf::from("left/newer.dat"),
@@ -2150,7 +2150,7 @@ mod tests {
             recursive_scope_known: true,
             conflicts: Vec::new(),
             warnings: vec!["Sources remain until verification succeeds".into()],
-            verification: Some(fileadmin_domain::VerificationMode::Full),
+            verification: Some(dirveyor_domain::VerificationMode::Full),
         });
 
         let screen = rendered_screen(&app, 160, 35);
@@ -2163,7 +2163,7 @@ mod tests {
     #[test]
     fn permanent_delete_mode_and_yes_no_confirmation_are_unmistakable() {
         let mut app = populated_app();
-        app.delete_mode = fileadmin_domain::DeleteMode::Permanent;
+        app.delete_mode = dirveyor_domain::DeleteMode::Permanent;
         let browse = rendered_screen(&app, 160, 35);
         assert!(browse.contains("D DELETE"));
         assert!(browse.contains("Ctrl+D Mode"));
@@ -2290,7 +2290,7 @@ mod tests {
             metadata_incomplete: false,
             drive_info: None,
         }];
-        app.folder_size = FolderSizeState::Ready(fileadmin_domain::FolderSizeSummary {
+        app.folder_size = FolderSizeState::Ready(dirveyor_domain::FolderSizeSummary {
             request_id: 3,
             pane: PaneId::Left,
             generation: 0,
@@ -2331,7 +2331,7 @@ mod tests {
             metadata_incomplete: false,
             drive_info: None,
         }];
-        app.folder_size = FolderSizeState::Loading(fileadmin_domain::FolderSizeProgress {
+        app.folder_size = FolderSizeState::Loading(dirveyor_domain::FolderSizeProgress {
             request_id: 9,
             pane: PaneId::Left,
             generation: 0,
@@ -2359,14 +2359,14 @@ mod tests {
     fn preview_replaces_the_complete_browse_layout() {
         let mut app = populated_app();
         app.preview = PreviewState::Ready(Box::new(PreviewSession::new(
-            fileadmin_domain::PreviewDocument {
+            dirveyor_domain::PreviewDocument {
                 request_id: 1,
                 path: PathBuf::from("Latest.log"),
                 file_size: 18,
                 modified: None,
-                kind: fileadmin_domain::PreviewKind::Log,
-                encoding: fileadmin_domain::PreviewEncoding::Utf8,
-                completeness: fileadmin_domain::PreviewCompleteness::Complete,
+                kind: dirveyor_domain::PreviewKind::Log,
+                encoding: dirveyor_domain::PreviewEncoding::Utf8,
+                completeness: dirveyor_domain::PreviewCompleteness::Complete,
                 window_start: 0,
                 window_end: 18,
                 raw_lines: vec!["INFO ready".into(), "ERROR stopped".into()],
@@ -2385,14 +2385,14 @@ mod tests {
     #[test]
     fn markdown_split_renders_raw_and_preview_regions() {
         let mut app = populated_app();
-        let document = fileadmin_domain::PreviewDocument {
+        let document = dirveyor_domain::PreviewDocument {
             request_id: 2,
             path: PathBuf::from("README.md"),
             file_size: 12,
             modified: None,
-            kind: fileadmin_domain::PreviewKind::Markdown,
-            encoding: fileadmin_domain::PreviewEncoding::Utf8,
-            completeness: fileadmin_domain::PreviewCompleteness::Complete,
+            kind: dirveyor_domain::PreviewKind::Markdown,
+            encoding: dirveyor_domain::PreviewEncoding::Utf8,
+            completeness: dirveyor_domain::PreviewCompleteness::Complete,
             window_start: 0,
             window_end: 12,
             raw_lines: vec!["# Heading".into()],
@@ -2416,14 +2416,14 @@ mod tests {
     #[test]
     fn windowed_preview_shows_byte_range_and_changed_notice() {
         let mut app = populated_app();
-        let document = fileadmin_domain::PreviewDocument {
+        let document = dirveyor_domain::PreviewDocument {
             request_id: 3,
             path: PathBuf::from("large.log"),
             file_size: 4 * 1024 * 1024,
             modified: None,
-            kind: fileadmin_domain::PreviewKind::Log,
-            encoding: fileadmin_domain::PreviewEncoding::Utf8,
-            completeness: fileadmin_domain::PreviewCompleteness::MiddleWindow,
+            kind: dirveyor_domain::PreviewKind::Log,
+            encoding: dirveyor_domain::PreviewEncoding::Utf8,
+            completeness: dirveyor_domain::PreviewCompleteness::MiddleWindow,
             window_start: 1024 * 1024,
             window_end: 2 * 1024 * 1024,
             raw_lines: vec!["middle".into()],
@@ -2488,7 +2488,7 @@ mod tests {
     fn dedicated_favorites_panel_lists_saved_paths_and_controls() {
         let mut app = populated_app();
         app.favorites = vec![PathBuf::from(r"D:\Projects")];
-        app.favorites_panel = Some(fileadmin_domain::FavoritesPanel::default());
+        app.favorites_panel = Some(dirveyor_domain::FavoritesPanel::default());
 
         let screen = rendered_screen(&app, 120, 30);
 
