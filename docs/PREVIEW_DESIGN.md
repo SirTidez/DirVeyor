@@ -1,6 +1,6 @@
 # Text file preview design
 
-Status: core preview implemented; large-file navigation and change monitoring pending
+Status: slices 1–3 implemented; preview polish and measured optimization pending
 
 ## 1. Goal
 
@@ -265,12 +265,12 @@ move the user's scroll position.
 - JSON Pretty and Raw modes with line/column parse errors;
 - mode-aware footer and help.
 
-### Slice 3 — large-file navigation (partial)
+### Slice 3 — large-file navigation (implemented)
 
-- implemented: bounded head/tail snapshots, line indexes, search-result caps,
-  partial-search labeling, and manual reload;
-- pending: middle/adjacent-window loading, multibyte boundary carry-over, and
-  automatic changed-file detection.
+- bounded head, middle, and tail byte windows with UTF-8/UTF-16-safe boundaries;
+- explicit and edge-triggered adjacent-window loading;
+- search-result caps and partial-search labeling;
+- background source-identity monitoring and explicit reload after changes.
 
 ### Slice 4 — polish and measured optimization
 

@@ -199,7 +199,9 @@ operation logs.
 
 The current search pass runs against the bounded in-memory representation when
 the query changes. Files through 8 MiB may be complete snapshots; larger files
-use a 1 MiB head or tail snapshot. Moving adjacent windows, automatic file-change
-detection, and asynchronous search are the next performance slice. The full
+use replaceable 1 MiB head, middle, or tail windows with UTF-8/UTF-16-aligned
+byte boundaries. A second background watcher compares source length and
+modified time and emits a one-shot changed event; it never reads preview
+contents. Asynchronous search is the next performance slice. The full
 interaction, resource-limit, and delivery plan is in
 [Text file preview design](PREVIEW_DESIGN.md).
