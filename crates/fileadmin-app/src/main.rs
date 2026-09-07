@@ -6,6 +6,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fileadmin_domain::{AppState, LoadState, PaneId, parent_or_same};
+use fileadmin_domain::{
+    JobOutcome, OperationIntent, OperationKind, OperationView, TextAction, TextPrompt,
+};
+use fileadmin_engine::{OperationEngine, OperationEvent, SubmitError};
 use fileadmin_fs::{DirectoryScanner, RequestError, ScanLocation, ScanRequest};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -23,29 +27,32 @@ fn main() -> AppResult<()> {
     let right = parent_or_same(&current);
     let mut app = AppState::new(current, right);
     let scanner = DirectoryScanner::new();
+    let operations = OperationEngine::new();
     queue_initial_scans(&mut app, &scanner);
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
 
-    run(&mut terminal, &mut app, &scanner)
+    run(&mut terminal, &mut app, &scanner, &operations)
 }
 
 fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut AppState,
     scanner: &DirectoryScanner,
+    operations: &OperationEngine,
 ) -> AppResult<()> {
     while !app.should_quit {
         drain_scan_events(app, scanner);
+        drain_operation_events(app, scanner, operations);
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(app, scanner, key);
+            handle_key(app, scanner, operations, key);
         }
     }
     Ok(())
@@ -83,9 +90,24 @@ fn drain_scan_events(app: &mut AppState, scanner: &DirectoryScanner) {
     }
 }
 
-fn handle_key(app: &mut AppState, scanner: &DirectoryScanner, key: KeyEvent) {
+fn handle_key(
+    app: &mut AppState,
+    scanner: &DirectoryScanner,
+    operations: &OperationEngine,
+    key: KeyEvent,
+) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
+        request_quit(app, operations);
+        return;
+    }
+
+    if app.text_prompt.is_some() {
+        handle_text_prompt(app, operations, key);
+        return;
+    }
+
+    if !matches!(app.operation, OperationView::Idle) {
+        handle_operation_key(app, operations, key);
         return;
     }
 
@@ -119,7 +141,7 @@ fn handle_key(app: &mut AppState, scanner: &DirectoryScanner, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => request_quit(app, operations),
         KeyCode::Tab | KeyCode::BackTab => app.switch_pane(),
         KeyCode::Up | KeyCode::Char('k') => app.active_mut().move_cursor(-1),
         KeyCode::Down | KeyCode::Char('j') => app.active_mut().move_cursor(1),
@@ -156,10 +178,270 @@ fn handle_key(app: &mut AppState, scanner: &DirectoryScanner, key: KeyEvent) {
             app.notice = Some(format!("Sorted by {}", app.active().sort.label()));
         }
         KeyCode::Char('?') | KeyCode::F(1) => app.help_visible = true,
-        KeyCode::Char('c' | 'm' | 'd' | 'r' | 'p') => {
-            app.notice = Some("Unavailable in the read-only prototype; no files changed".into());
+        KeyCode::Char('c') => submit_transfer(app, operations, OperationKind::Copy),
+        KeyCode::Char('m') => submit_transfer(app, operations, OperationKind::Move),
+        KeyCode::Char('d') | KeyCode::Delete => submit_recycle(app, operations),
+        KeyCode::Char('r') | KeyCode::F(2) => begin_rename(app),
+        KeyCode::Char('n') => begin_create_directory(app),
+        _ => {}
+    }
+}
+
+fn drain_operation_events(
+    app: &mut AppState,
+    scanner: &DirectoryScanner,
+    operations: &OperationEngine,
+) {
+    while let Ok(event) = operations.try_recv() {
+        match event {
+            OperationEvent::Planning { job, kind } => {
+                app.operation = OperationView::Planning { job, kind };
+            }
+            OperationEvent::PlanReady(summary) => {
+                app.operation = OperationView::Review(summary);
+            }
+            OperationEvent::Progress(progress) => {
+                app.operation = OperationView::Running(progress);
+            }
+            OperationEvent::Finished(report) => {
+                let outcome = report.outcome;
+                let kind = report.kind;
+                refresh_affected_panes(app, scanner, &report.affected_directories);
+                app.notice = Some(format!(
+                    "{} {}: {} of {} items",
+                    outcome_label(outcome),
+                    kind.label(),
+                    report.completed_items,
+                    report.total_items
+                ));
+                app.operation = OperationView::Finished(report);
+            }
+            OperationEvent::Failed { job, kind, message } => {
+                app.operation = OperationView::Error { job, kind, message };
+            }
+        }
+    }
+}
+
+fn handle_operation_key(app: &mut AppState, operations: &OperationEngine, key: KeyEvent) {
+    match &app.operation {
+        OperationView::Planning { .. } => {
+            if key.code == KeyCode::Esc {
+                operations.cancel();
+                app.notice = Some("Cancellation requested while planning".into());
+            }
+        }
+        OperationView::Review(summary) => match key.code {
+            KeyCode::Enter => {
+                if let Err(error) = operations.approve(summary.job) {
+                    app.notice = Some(submit_error_message(error));
+                }
+            }
+            KeyCode::Esc => {
+                let job = summary.job;
+                if operations.abandon(job).is_ok() {
+                    app.operation = OperationView::Idle;
+                    app.notice = Some("Operation cancelled; no files changed".into());
+                }
+            }
+            _ => {}
+        },
+        OperationView::Running(progress) => {
+            if matches!(
+                key.code,
+                KeyCode::Char('x') | KeyCode::Char('c') | KeyCode::Esc
+            ) {
+                operations.cancel();
+                let mut progress = progress.clone();
+                progress.phase = fileadmin_domain::JobPhase::Cancelling;
+                app.operation = OperationView::Running(progress);
+                app.notice = Some("Cancellation requested; finishing the current safe step".into());
+            }
+        }
+        OperationView::Finished(_) | OperationView::Error { .. } => {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                app.operation = OperationView::Idle;
+            }
+        }
+        OperationView::Idle => {}
+    }
+}
+
+fn handle_text_prompt(app: &mut AppState, operations: &OperationEngine, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.text_prompt = None,
+        KeyCode::Backspace => {
+            if let Some(prompt) = &mut app.text_prompt {
+                prompt.value.pop();
+                prompt.error = None;
+            }
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if let Some(prompt) = &mut app.text_prompt {
+                prompt.value.push(character);
+                prompt.error = None;
+            }
+        }
+        KeyCode::Enter => {
+            let Some(prompt) = app.text_prompt.clone() else {
+                return;
+            };
+            if prompt.value.trim().is_empty() {
+                if let Some(prompt) = &mut app.text_prompt {
+                    prompt.error = Some("A name is required".into());
+                }
+                return;
+            }
+            let kind = match &prompt.action {
+                TextAction::Rename { .. } => OperationKind::Rename,
+                TextAction::CreateDirectory { .. } => OperationKind::CreateDirectory,
+            };
+            let intent = match prompt.action {
+                TextAction::Rename { source } => OperationIntent::Rename {
+                    source,
+                    new_name: prompt.value.into(),
+                },
+                TextAction::CreateDirectory { parent } => OperationIntent::CreateDirectory {
+                    parent,
+                    name: prompt.value.into(),
+                },
+            };
+            match operations.submit(intent) {
+                Ok(job) => {
+                    app.operation = OperationView::Planning { job, kind };
+                    app.text_prompt = None;
+                }
+                Err(error) => {
+                    if let Some(prompt) = &mut app.text_prompt {
+                        prompt.error = Some(submit_error_message(error));
+                    }
+                }
+            }
         }
         _ => {}
+    }
+}
+
+fn submit_transfer(app: &mut AppState, operations: &OperationEngine, kind: OperationKind) {
+    let sources = app.operation_sources();
+    if sources.is_empty() {
+        app.notice = Some("Select or focus a file or directory first".into());
+        return;
+    }
+    let destination_pane = app.pane(app.active_pane.other());
+    if destination_pane.browsing_drives || !matches!(destination_pane.load_state, LoadState::Ready)
+    {
+        app.notice = Some("Open a destination directory in the other pane first".into());
+        return;
+    }
+    let destination = destination_pane.location.clone();
+    let intent = match kind {
+        OperationKind::Copy => OperationIntent::Copy {
+            sources,
+            destination,
+        },
+        OperationKind::Move => OperationIntent::Move {
+            sources,
+            destination,
+        },
+        _ => return,
+    };
+    submit_intent(app, operations, intent);
+}
+
+fn submit_recycle(app: &mut AppState, operations: &OperationEngine) {
+    let sources = app.operation_sources();
+    if sources.is_empty() {
+        app.notice = Some("Select or focus a file or directory first".into());
+        return;
+    }
+    submit_intent(app, operations, OperationIntent::Recycle { sources });
+}
+
+fn submit_intent(app: &mut AppState, operations: &OperationEngine, intent: OperationIntent) {
+    let kind = intent.kind();
+    match operations.submit(intent) {
+        Ok(job) => app.operation = OperationView::Planning { job, kind },
+        Err(error) => app.notice = Some(submit_error_message(error)),
+    }
+}
+
+fn begin_rename(app: &mut AppState) {
+    let Some(entry) = app
+        .active()
+        .focused()
+        .filter(|entry| !entry.is_parent() && !entry.is_drive())
+    else {
+        app.notice = Some("Focus a file or directory to rename".into());
+        return;
+    };
+    app.text_prompt = Some(TextPrompt {
+        action: TextAction::Rename {
+            source: entry.path.clone(),
+        },
+        value: entry.display_name.clone(),
+        error: None,
+    });
+}
+
+fn begin_create_directory(app: &mut AppState) {
+    if app.active().browsing_drives || !matches!(app.active().load_state, LoadState::Ready) {
+        app.notice = Some("Open a directory before creating a folder".into());
+        return;
+    }
+    app.text_prompt = Some(TextPrompt {
+        action: TextAction::CreateDirectory {
+            parent: app.active().location.clone(),
+        },
+        value: String::new(),
+        error: None,
+    });
+}
+
+fn refresh_affected_panes(app: &mut AppState, scanner: &DirectoryScanner, affected: &[PathBuf]) {
+    for pane_id in PaneId::ALL {
+        let pane = app.pane(pane_id);
+        if pane.browsing_drives {
+            continue;
+        }
+        if affected.iter().any(|path| path == &pane.location) {
+            let target = pane.location.clone();
+            let generation = app.pane_mut(pane_id).begin_load(target.clone());
+            let _ = scanner.request(ScanRequest {
+                pane: pane_id,
+                generation,
+                location: ScanLocation::Directory(target),
+            });
+        }
+    }
+}
+
+fn request_quit(app: &mut AppState, operations: &OperationEngine) {
+    if operations.is_busy() || app.operation.is_busy() {
+        operations.cancel();
+        app.notice = Some("An operation is active; cancellation requested before exit".into());
+    } else {
+        app.should_quit = true;
+    }
+}
+
+fn submit_error_message(error: SubmitError) -> String {
+    match error {
+        SubmitError::Busy => "Another operation is already active".into(),
+        SubmitError::Closed => "The operation engine is unavailable".into(),
+    }
+}
+
+fn outcome_label(outcome: JobOutcome) -> &'static str {
+    match outcome {
+        JobOutcome::Completed => "Completed",
+        JobOutcome::Partial => "Partially completed",
+        JobOutcome::Cancelled => "Cancelled",
+        JobOutcome::Failed => "Failed",
     }
 }
 

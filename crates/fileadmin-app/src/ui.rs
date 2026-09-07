@@ -1,4 +1,7 @@
-use fileadmin_domain::{AppState, DriveInfo, DriveKind, EntryKind, LoadState, PaneId, PaneState};
+use fileadmin_domain::{
+    AppState, DriveInfo, DriveKind, EntryKind, JobOutcome, JobPhase, LoadState, OperationKind,
+    OperationView, PaneId, PaneState, PlanSummary, TextAction, TextPrompt,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -67,15 +70,33 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
     if app.help_visible {
         render_help(frame, area);
+    } else if let Some(prompt) = &app.text_prompt {
+        render_text_prompt(frame, area, prompt);
+    } else if !matches!(app.operation, OperationView::Idle) {
+        render_operation(frame, area, &app.operation);
     }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
     let selection = app.selected_count();
-    let status = app
-        .notice
+    let operation_status = match &app.operation {
+        OperationView::Idle => None,
+        OperationView::Planning { kind, .. } => Some(format!("Planning {}…", kind.label())),
+        OperationView::Review(summary) => {
+            Some(format!("Review {} before execution", summary.kind.label()))
+        }
+        OperationView::Running(progress) => Some(progress_status(progress)),
+        OperationView::Finished(report) => Some(format!(
+            "{} {}",
+            outcome_label(report.outcome),
+            report.kind.label()
+        )),
+        OperationView::Error { kind, .. } => Some(format!("{} plan failed", kind.label())),
+    };
+    let status = operation_status
         .as_deref()
-        .unwrap_or("Browse · filesystem writes disabled");
+        .or(app.notice.as_deref())
+        .unwrap_or("Ready");
     let line = Line::from(vec![
         Span::styled(
             " FileAdmin ",
@@ -268,9 +289,10 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
         },
         Line::raw(""),
         Line::styled(
-            "READ-ONLY · copy, move, rename, and delete are disabled",
-            Style::default().fg(Color::Yellow),
+            "c Copy · m Move · d Recycle",
+            Style::default().fg(Color::Cyan),
         ),
+        Line::styled("r Rename · n New folder", Style::default().fg(Color::Cyan)),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -351,9 +373,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             app.active().filter
         )
     } else if area.width >= 110 {
-        " Tab Pane  ↑↓/jk Navigate  Space Select  Enter Open  / Filter  h Hidden  s Sort  F1 Help  q Quit".into()
+        " Tab Pane  ↑↓ Navigate  Space Select  c Copy  m Move  d Recycle  r Rename  n Folder  F1 Help".into()
     } else {
-        " Tab Pane  ↑↓ Navigate  Space Select  Enter Open  / Filter  F1 Help  q Quit".into()
+        " Tab Pane  ↑↓ Move  Space Select  Enter Open  c Copy  m Move  d Recycle  F1 Help".into()
     };
     frame.render_widget(
         Paragraph::new(truncate(&text, area.width as usize))
@@ -366,7 +388,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(72, 78, area);
     let lines = vec![
         Line::styled(
-            "FileAdmin read-only controls",
+            "FileAdmin controls",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -381,10 +403,15 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::raw("/                  Filter active pane"),
         Line::raw("h                  Toggle dotfiles"),
         Line::raw("s                  Cycle sort field"),
+        Line::raw("c                  Plan copy to other pane"),
+        Line::raw("m                  Plan move to other pane"),
+        Line::raw("d / Delete         Plan move to Recycle Bin / Trash"),
+        Line::raw("r / F2             Rename focused item"),
+        Line::raw("n                  Create a folder in the active pane"),
         Line::raw("q / Ctrl+C         Quit"),
         Line::raw(""),
         Line::styled(
-            "Copy, move, rename, delete, queue, and external file opening are intentionally disabled.",
+            "All mutations are planned and reviewed first. Existing destinations are never overwritten.",
             Style::default().fg(Color::Yellow),
         ),
         Line::raw(""),
@@ -401,6 +428,379 @@ fn render_help(frame: &mut Frame, area: Rect) {
             .wrap(Wrap { trim: false }),
         popup,
     );
+}
+
+fn render_text_prompt(frame: &mut Frame, area: Rect, prompt: &TextPrompt) {
+    let popup = centered_rect(72, 34, area);
+    let (title, action, context) = match &prompt.action {
+        TextAction::Rename { source } => (
+            " Rename ",
+            "Enter Plan rename",
+            format!("Current: {}", safe_text(&source.to_string_lossy())),
+        ),
+        TextAction::CreateDirectory { parent } => (
+            " New folder ",
+            "Enter Plan creation",
+            format!("Inside: {}", safe_text(&parent.to_string_lossy())),
+        ),
+    };
+    let mut lines = vec![
+        Line::raw(context),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}_", safe_text(&prompt.value)),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::styled(
+            safe_text(error),
+            Style::default().fg(Color::Red),
+        ));
+    } else {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("{action}   Esc Cancel"),
+        Style::default().fg(Color::Cyan),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_operation(frame: &mut Frame, area: Rect, operation: &OperationView) {
+    match operation {
+        OperationView::Idle => {}
+        OperationView::Planning { kind, .. } => render_planning(frame, area, *kind),
+        OperationView::Review(summary) => render_review(frame, area, summary),
+        OperationView::Running(progress) => render_running(frame, area, progress),
+        OperationView::Finished(report) => render_finished(frame, area, report),
+        OperationView::Error { kind, message, .. } => {
+            render_operation_error(frame, area, *kind, message)
+        }
+    }
+}
+
+fn render_planning(frame: &mut Frame, area: Rect, kind: OperationKind) {
+    let popup = centered_rect(74, 28, area);
+    let lines = vec![
+        Line::styled(
+            format!("Discovering exact scope for {}…", kind.label()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("Checking paths, conflicts, links, capacity strategy, and item totals."),
+        Line::raw("No files have changed."),
+        Line::raw(""),
+        Line::styled(
+            "Esc Request cancellation",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    render_modal(
+        frame,
+        popup,
+        &format!(" Plan {} ", kind.label()),
+        lines,
+        Color::Cyan,
+    );
+}
+
+fn render_review(frame: &mut Frame, area: Rect, summary: &PlanSummary) {
+    let popup = centered_rect(84, 82, area);
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "{} items · {} files · {}",
+                summary.item_count,
+                summary.file_count,
+                human_size(summary.total_bytes)
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!("Strategy: {}", summary.strategy.label())),
+    ];
+    if let Some(destination) = &summary.destination {
+        lines.push(Line::raw(format!(
+            "Destination: {}",
+            safe_text(&destination.to_string_lossy())
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Sources",
+        Style::default().fg(Color::DarkGray),
+    ));
+    for source in summary.sources.iter().take(4) {
+        lines.push(Line::raw(format!(
+            "  {}",
+            safe_text(&source.to_string_lossy())
+        )));
+    }
+    if summary.sources.len() > 4 {
+        lines.push(Line::raw(format!(
+            "  … and {} more",
+            summary.sources.len() - 4
+        )));
+    }
+    if !summary.conflicts.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(
+                "{} name conflicts will use numbered Keep both names",
+                summary.conflicts.len()
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+        for conflict in summary.conflicts.iter().take(2) {
+            lines.push(Line::raw(format!(
+                "  → {}",
+                safe_text(&conflict.resolved_destination.to_string_lossy())
+            )));
+        }
+    }
+    for warning in &summary.warnings {
+        lines.push(Line::styled(
+            format!("! {}", safe_text(warning)),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        review_confirmation(summary.kind),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::styled(
+        "Esc Back — no files will change",
+        Style::default().fg(Color::DarkGray),
+    ));
+    render_modal(
+        frame,
+        popup,
+        &format!(" Review {} ", summary.kind.label()),
+        lines,
+        if summary.kind == OperationKind::Recycle {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        },
+    );
+}
+
+fn render_running(frame: &mut Frame, area: Rect, progress: &fileadmin_domain::OperationProgress) {
+    let popup = centered_rect(78, 42, area);
+    let percent = progress_percent(progress.completed_bytes, progress.total_bytes)
+        .or_else(|| progress_percent(progress.completed_items, progress.total_items));
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "{} · {}",
+                progress.kind.label(),
+                phase_label(progress.phase)
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(progress_bar(percent.unwrap_or(0), 36)),
+        Line::raw(format!(
+            "Items: {} / {}",
+            progress.completed_items, progress.total_items
+        )),
+        Line::raw(format!(
+            "Transferred: {} / {}",
+            human_size(progress.completed_bytes),
+            human_size(progress.total_bytes)
+        )),
+    ];
+    if let Some(path) = &progress.current_path {
+        lines.push(Line::raw(format!(
+            "Current: {}",
+            safe_text(&path.to_string_lossy())
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        if progress.phase == JobPhase::Cancelling {
+            "Cancellation requested · waiting for the current safe step"
+        } else {
+            "x / c / Esc  Cancel safely"
+        },
+        Style::default().fg(Color::Yellow),
+    ));
+    render_modal(frame, popup, " Operation in progress ", lines, Color::Cyan);
+}
+
+fn render_finished(frame: &mut Frame, area: Rect, report: &fileadmin_domain::OperationReport) {
+    let popup = centered_rect(78, 58, area);
+    let color = match report.outcome {
+        JobOutcome::Completed => Color::Green,
+        JobOutcome::Partial => Color::Yellow,
+        JobOutcome::Cancelled => Color::DarkGray,
+        JobOutcome::Failed => Color::Red,
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!("{} {}", outcome_label(report.outcome), report.kind.label()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{} of {} items · {} transferred",
+            report.completed_items,
+            report.total_items,
+            human_size(report.completed_bytes)
+        )),
+    ];
+    if report.failures.is_empty() {
+        lines.push(Line::raw("Affected panes have been refreshed."));
+    } else {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Details",
+            Style::default().fg(Color::DarkGray),
+        ));
+        for failure in report.failures.iter().take(4) {
+            let path = failure
+                .path
+                .as_ref()
+                .map(|path| safe_text(&path.to_string_lossy()))
+                .unwrap_or_else(|| "Operation".into());
+            lines.push(Line::styled(
+                format!("{path}: {}", safe_text(&failure.message)),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Enter / Esc  Return to browser",
+        Style::default().fg(Color::Cyan),
+    ));
+    render_modal(frame, popup, " Operation result ", lines, color);
+}
+
+fn render_operation_error(frame: &mut Frame, area: Rect, kind: OperationKind, message: &str) {
+    let popup = centered_rect(76, 42, area);
+    let lines = vec![
+        Line::styled(
+            format!("Could not plan {}", kind.label()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(safe_text(message)),
+        Line::raw(""),
+        Line::styled("No files were changed.", Style::default().fg(Color::Green)),
+        Line::raw(""),
+        Line::styled("Enter / Esc  Return", Style::default().fg(Color::Cyan)),
+    ];
+    render_modal(frame, popup, " Operation blocked ", lines, Color::Red);
+}
+
+fn render_modal(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    color: Color,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_owned())
+        .border_style(Style::default().fg(color));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn review_confirmation(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Copy => "Enter Execute copy",
+        OperationKind::Move => "Enter Execute move",
+        OperationKind::Recycle => "Enter Move to Recycle Bin / Trash",
+        OperationKind::Rename => "Enter Execute rename",
+        OperationKind::CreateDirectory => "Enter Create folder",
+    }
+}
+
+fn phase_label(phase: JobPhase) -> &'static str {
+    match phase {
+        JobPhase::Planning => "planning",
+        JobPhase::AwaitingReview => "awaiting review",
+        JobPhase::Running => "running",
+        JobPhase::Cancelling => "cancelling",
+        JobPhase::Verifying => "verifying",
+        JobPhase::Finalizing => "finalizing",
+    }
+}
+
+fn outcome_label(outcome: JobOutcome) -> &'static str {
+    match outcome {
+        JobOutcome::Completed => "Completed",
+        JobOutcome::Partial => "Partially completed",
+        JobOutcome::Cancelled => "Cancelled",
+        JobOutcome::Failed => "Failed",
+    }
+}
+
+fn progress_status(progress: &fileadmin_domain::OperationProgress) -> String {
+    let percent = progress_percent(progress.completed_bytes, progress.total_bytes)
+        .or_else(|| progress_percent(progress.completed_items, progress.total_items));
+    match percent {
+        Some(percent) => format!(
+            "{} {}% · {}",
+            progress.kind.label(),
+            percent,
+            phase_label(progress.phase)
+        ),
+        None => format!(
+            "{} · {}",
+            progress.kind.label(),
+            phase_label(progress.phase)
+        ),
+    }
+}
+
+fn progress_percent(completed: u64, total: u64) -> Option<u8> {
+    if total == 0 {
+        None
+    } else {
+        Some(((completed as u128 * 100) / total as u128).min(100) as u8)
+    }
+}
+
+fn progress_bar(percent: u8, width: usize) -> String {
+    let filled = (usize::from(percent) * width + 50) / 100;
+    format!(
+        "[{}{}] {percent}%",
+        "█".repeat(filled.min(width)),
+        "░".repeat(width.saturating_sub(filled))
+    )
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect) {
@@ -528,7 +928,7 @@ fn modified_label(modified: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fileadmin_domain::{FileEntry, LoadState};
+    use fileadmin_domain::{FileEntry, JobId, LoadState, OperationProgress, PlannedStrategy};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -549,6 +949,19 @@ mod tests {
             }];
         }
         app
+    }
+
+    fn rendered_screen(app: &AppState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]
@@ -633,5 +1046,66 @@ mod tests {
         assert!(screen.contains("Capacity: 1000 B"));
         assert!(screen.contains("Available: 250 B"));
         assert!(screen.contains("75%"));
+    }
+
+    #[test]
+    fn operation_review_names_the_destination_and_requires_confirmation() {
+        let mut app = populated_app();
+        app.operation = OperationView::Review(PlanSummary {
+            job: JobId(7),
+            kind: OperationKind::Move,
+            sources: vec![PathBuf::from("left").join("example.txt")],
+            destination: Some(PathBuf::from("right")),
+            strategy: PlannedStrategy::CopyVerifyRemove,
+            item_count: 1,
+            file_count: 1,
+            total_bytes: 1_024,
+            conflicts: Vec::new(),
+            warnings: vec!["Sources remain until verification succeeds".into()],
+        });
+
+        let screen = rendered_screen(&app, 120, 30);
+        assert!(screen.contains("Review move"));
+        assert!(screen.contains("Destination: right"));
+        assert!(screen.contains("Enter Execute move"));
+        assert!(screen.contains("Esc Back — no files will change"));
+    }
+
+    #[test]
+    fn operation_progress_exposes_cancel_and_completion_counts() {
+        let mut app = populated_app();
+        app.operation = OperationView::Running(OperationProgress {
+            job: JobId(8),
+            kind: OperationKind::Copy,
+            phase: JobPhase::Running,
+            completed_items: 2,
+            total_items: 4,
+            completed_bytes: 512,
+            total_bytes: 1_024,
+            current_path: Some(PathBuf::from("right").join("example.txt")),
+        });
+
+        let screen = rendered_screen(&app, 120, 30);
+        assert!(screen.contains("Operation in progress"));
+        assert!(screen.contains("Items: 2 / 4"));
+        assert!(screen.contains("50%"));
+        assert!(screen.contains("Cancel safely"));
+    }
+
+    #[test]
+    fn rename_prompt_shows_editable_name_and_non_mutating_escape_hint() {
+        let mut app = populated_app();
+        app.text_prompt = Some(TextPrompt {
+            action: TextAction::Rename {
+                source: PathBuf::from("left").join("example.txt"),
+            },
+            value: "renamed.txt".into(),
+            error: None,
+        });
+
+        let screen = rendered_screen(&app, 120, 30);
+        assert!(screen.contains("Rename"));
+        assert!(screen.contains("renamed.txt"));
+        assert!(screen.contains("Esc Cancel"));
     }
 }

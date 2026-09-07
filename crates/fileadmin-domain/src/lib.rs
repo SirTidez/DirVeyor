@@ -337,7 +337,7 @@ impl AppState {
             active_pane: PaneId::Left,
             help_visible: false,
             filter_mode: false,
-            notice: Some("Read-only prototype: filesystem changes are disabled".into()),
+            notice: Some("Ready · c Copy · m Move · d Recycle · r Rename · n New folder".into()),
             should_quit: false,
             operation: OperationView::Idle,
             text_prompt: None,
