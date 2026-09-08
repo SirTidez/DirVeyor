@@ -28,7 +28,7 @@ The foreground loop is the sole owner of terminal and application state.
 Workers never render and never mutate application state. The UI never performs
 filesystem work directly, and only one operation may be active at a time.
 
-The focused-folder size inspector has its own single background worker. It keeps
+The focused-folder size inspector has its own background coordinator. It keeps
 only the newest request, checks cancellation throughout traversal, and keys each
 result by pane, pane generation, path, and request id. Rapid scrolling therefore
 replaces old work instead of building a queue, and stale results cannot attach to
@@ -36,7 +36,16 @@ a different focused item. Folder analysis also yields whenever a reviewed file
 operation is active so it does not compete with planning or transfer I/O. The
 worker emits throttled accumulated-byte and discovered-item updates, retains a
 small generation-scoped result cache, and reuses directory-entry metadata to
-avoid redundant Windows path lookups.
+avoid redundant Windows path lookups. Uncached analysis waits 200 ms for focus
+to settle; replacement requests and cancellation wake that wait early.
+Each uncached traversal uses four scoped workers with a shared backlog capped
+at 1,024 directories. When the queue is full, a worker descends locally with an
+explicit iterator stack. File counts and bytes merge in batches of 256 entries;
+the coordinator reports progress about every 100 ms. Windows size walks use
+`FindFirstFileExW` with basic information and large fetch, read sizes directly
+from enumeration records, and allocate child paths only for directories.
+The native backend skips reparse points, supports verbatim long paths, and
+falls back to ordinary fetch flags if the filesystem rejects large fetch.
 
 ## Workspace crates
 
@@ -59,8 +68,8 @@ This crate is the seam for state-machine and property tests.
 
 Read-only filesystem adapter:
 
-- two named background workers;
-- bounded request and result channels;
+- two named background workers, one per pane;
+- one replaceable pending request per pane and a bounded result channel;
 - directory and metadata reads;
 - stable error classifications and user-safe messages;
 - filename control/bidirectional-character sanitization;
@@ -119,9 +128,10 @@ applies it only if the generation is still current, preventing a slow result
 from an older path replacing the latest view.
 
 The current scanner returns one bounded listing rather than incremental
-batches. The event model is deliberately small for this milestone. A later
-version should add batches, cancellation tokens, and coalescing without changing
-the pane generation contract.
+batches. Each pane replaces its pending request and cancels its previous scan.
+Directory scans check cancellation before opening and between entries. A slow
+pane cannot occupy the other pane's worker, although individual blocked system
+calls cannot be interrupted. Incremental batches remain a possible extension.
 
 ## Sorting and selection semantics
 
@@ -129,6 +139,12 @@ Directories sort before non-directories. The active sort field then determines
 the primary order, with display name and path used as deterministic tie-breakers.
 Selection is stored by path rather than row index, so sorting and cursor movement
 cannot silently select a different item. Location changes clear selection.
+
+Each listing caches normalized names and visible indices. State methods rebuild
+the view when entries, filtering, visibility, or sorting change; read access
+borrows the cached slice. Ordinary directory rendering constructs only viewport
+rows. See [enumeration performance](ENUMERATION_PERFORMANCE.md) for benchmarks
+and remaining experiments.
 
 Filtering is case-insensitive and applies to the loaded subset. Dot-prefixed
 files are concealed by default on every platform in this prototype. Native

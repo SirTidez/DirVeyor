@@ -1,6 +1,15 @@
 /target/
+/dist/
 *.pdb
 *.log
 .idea/
 .vscode/
 
+# Local configuration and credential files.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12

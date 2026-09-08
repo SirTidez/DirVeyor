@@ -460,7 +460,7 @@ fn handle_key(
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.filter_mode = false,
             KeyCode::Backspace => {
-                let mut filter = app.active().filter.clone();
+                let mut filter = app.active().filter().to_owned();
                 filter.pop();
                 app.active_mut().set_filter(filter);
             }
@@ -469,7 +469,7 @@ fn handle_key(
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let mut filter = app.active().filter.clone();
+                let mut filter = app.active().filter().to_owned();
                 filter.push(character);
                 app.active_mut().set_filter(filter);
             }
@@ -528,9 +528,9 @@ fn handle_key(
         KeyCode::Char('h') | KeyCode::Char('H') => {
             let shown = {
                 let pane = app.active_mut();
-                pane.show_hidden = !pane.show_hidden;
+                pane.toggle_hidden();
                 pane.cursor = pane.cursor.min(pane.visible_len().saturating_sub(1));
-                pane.show_hidden
+                pane.show_hidden()
             };
             app.notice = Some(
                 if shown {
@@ -543,7 +543,7 @@ fn handle_key(
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
             app.active_mut().cycle_sort();
-            app.notice = Some(format!("Sorted by {}", app.active().sort.label()));
+            app.notice = Some(format!("Sorted by {}", app.active().sort().label()));
         }
         KeyCode::Char('?') | KeyCode::F(1) => app.help_visible = true,
         KeyCode::Char('c') | KeyCode::Char('C') => {

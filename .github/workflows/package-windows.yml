@@ -1,0 +1,41 @@
+name: Package Windows
+
+# Produces reviewable artifacts only. The Release workflow creates draft releases.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Test installer
+        shell: powershell
+        run: ./tests/installer.tests.ps1
+      - name: Package Windows x64
+        shell: powershell
+        run: ./scripts/package-windows.ps1
+      - name: Verify packaged installation
+        shell: powershell
+        run: |
+          $package = Get-ChildItem -LiteralPath dist -Filter '*.zip' | Select-Object -First 1
+          ./tests/installer.tests.ps1 -PackagePath $package.FullName
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dirveyor-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14

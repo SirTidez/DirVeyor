@@ -4,7 +4,12 @@
 
 DirVeyor is a Rust terminal application for fast, understandable file
 management. It combines a keyboard-first two-pane browser with an explicit
-operation queue, device-aware transfer planning, and safety-focused previews.
+operation review, device-aware transfer planning, and safety-focused previews.
+
+**Status: early development, Windows x64.** The current source version is
+0.1.0. Linux and macOS are not currently supported releases. Automated checks
+cover state, rendering, planning, and read-only scanning; file-changing release
+acceptance still requires an attended run against disposable data.
 
 The current milestone combines a functional two-pane browser with reviewed
 filesystem operations. It can navigate and select in either pane, filter and
@@ -45,7 +50,7 @@ folders merge; colliding files pause discovery for a six-choice conflict decisio
 while already queued work continues. File conflicts and file/folder type
 conflicts have separate per-job Apply-to-all policies. Recycle
 uses the operating-system Recycle Bin or Trash and never falls back to permanent
-deletion. Permanent deletion is a separate mode with an additional typed
+deletion. Permanent deletion is a separate mode with an explicit Yes/No
 confirmation. Its planning screen scans the full tree without changing it, and
 its review and progress screens report files, folders, and logical bytes instead
 of treating a large directory as one item.
@@ -54,8 +59,38 @@ of treating a large directory as one item.
 
 ### Running DirVeyor
 
-Normal use starts with the packaged `dirveyor.exe`; Rust and Cargo are not
-required. Open the executable directly or run it from a terminal:
+After the first release is published, install the latest stable Windows x64
+release from PowerShell (Windows PowerShell 5.1 or PowerShell 7):
+
+```powershell
+irm https://raw.githubusercontent.com/SirTidez/DirVeyor/main/install.ps1 | iex
+```
+
+The installer verifies the release's SHA-256 checksum, installs to
+`%LOCALAPPDATA%\Programs\DirVeyor`, and adds that directory to your user PATH.
+It does not require administrator access. Run `dirveyor` afterward; rerun the
+same installer to update or repair missing/corrupted program files. It remembers
+custom installation directories and PATH preferences, reinstalls even the same
+version, and preserves favorites and application settings. Close DirVeyor before
+updating or repairing. Until a stable GitHub
+release exists, the installer reports that no release is available; use the
+source-build instructions below.
+
+To review the installer first, save and inspect it, then run it. `-NoPath`
+disables PATH changes; `-InstallDir` selects another installation directory:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/SirTidez/DirVeyor/main/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+.\install.ps1 -NoPath -InstallDir "$env:LOCALAPPDATA\Programs\DirVeyor"
+```
+
+An explicit repair is also available with `.\install.ps1 -Repair`. It installs
+the latest stable release; it does not restore files deleted through DirVeyor.
+
+You can also extract the Windows ZIP from
+[GitHub Releases](https://github.com/SirTidez/DirVeyor/releases) manually. Rust
+and Cargo are not required for packaged builds. Launch from a terminal:
 
 ```console
 .\dirveyor.exe
@@ -91,7 +126,11 @@ panel.
 
 Focusing a directory starts background analysis without blocking navigation.
 The inspector reports contained size, drive share, and discovered file and
-folder counts.
+folder counts. Large folder analysis uses four bounded traversal workers and
+Windows bulk enumeration. An uncached scan starts after focus settles for
+200 ms. The first scan of a large tree on a hard drive can still take time;
+the inspector shows accumulated counts while it runs. See
+[enumeration performance](docs/ENUMERATION_PERFORMANCE.md) for measured results.
 
 ![DirVeyor browsing two folders while the inspector displays a focused directory's contained size and drive share](docs/images/folder-inspector.png)
 
@@ -235,9 +274,10 @@ normal end-user launch path.
 
 ```console
 cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release --workspace
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release --workspace --locked
+powershell -NoProfile -File tests/installer.tests.ps1
 ```
 
 ### Design documents
@@ -246,6 +286,9 @@ cargo build --release --workspace
 - [Interface concepts](docs/INTERFACE_CONCEPTS.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Text preview design](docs/PREVIEW_DESIGN.md)
+- [Enumeration performance](docs/ENUMERATION_PERFORMANCE.md)
+- [Contributing](CONTRIBUTING.md)
+- [Preparing a GitHub release](docs/RELEASING.md)
 
 ### Current phase and safety boundary
 

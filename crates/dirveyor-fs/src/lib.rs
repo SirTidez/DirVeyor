@@ -3,6 +3,7 @@
 mod favorites;
 mod folder_size;
 mod preview;
+mod size_entries;
 
 pub use favorites::{FavoritesStore, MAX_FAVORITES, user_home_directory};
 pub use folder_size::{FolderSizeEvent, FolderSizeRequest, FolderSizeScanner, FolderSizeUpdate};
@@ -12,13 +13,12 @@ use dirveyor_domain::{DriveInfo, DriveKind, EntryKind, FileEntry, PaneId};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-const REQUEST_CAPACITY: usize = 8;
 const RESULT_CAPACITY: usize = 8;
-const WORKER_COUNT: usize = 2;
 pub const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 
 #[derive(Clone, Debug)]
@@ -93,18 +93,49 @@ pub enum RequestError {
 }
 
 pub struct DirectoryScanner {
-    requests: SyncSender<ScanRequest>,
+    mailboxes: [Arc<ScanMailbox>; 2],
     results: Receiver<ScanEvent>,
+}
+
+#[derive(Default)]
+struct ScanMailbox {
+    state: Mutex<ScanMailboxState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct ScanMailboxState {
+    pending: Option<(ScanRequest, Arc<AtomicBool>)>,
+    current: Option<Arc<AtomicBool>>,
+    closed: bool,
+}
+
+impl ScanMailbox {
+    fn request(&self, request: ScanRequest) -> Result<(), RequestError> {
+        let mut state = self.state.lock().expect("directory request queue poisoned");
+        if state.closed {
+            return Err(RequestError::Closed);
+        }
+        if let Some(previous) = state.current.take() {
+            previous.store(true, Ordering::Release);
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.current = Some(Arc::clone(&cancelled));
+        state.pending = Some((request, cancelled));
+        self.ready.notify_one();
+        Ok(())
+    }
 }
 
 impl DirectoryScanner {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::sync_channel::<ScanRequest>(REQUEST_CAPACITY);
         let (result_tx, result_rx) = mpsc::sync_channel::<ScanEvent>(RESULT_CAPACITY);
-        let shared_requests = Arc::new(Mutex::new(request_rx));
+        let mailboxes = std::array::from_fn(|_| Arc::new(ScanMailbox::default()));
 
-        for worker_number in 0..WORKER_COUNT {
-            let requests = Arc::clone(&shared_requests);
+        // One latest-request mailbox per pane keeps a slow pane from occupying
+        // both workers. Queued requests are replaced instead of accumulating.
+        for (worker_number, mailbox) in mailboxes.iter().enumerate() {
+            let requests = Arc::clone(mailbox);
             let results = result_tx.clone();
             thread::Builder::new()
                 .name(format!("dirveyor-scan-{worker_number}"))
@@ -113,22 +144,38 @@ impl DirectoryScanner {
         }
 
         Self {
-            requests: request_tx,
+            mailboxes,
             results: result_rx,
         }
     }
 
     pub fn request(&self, request: ScanRequest) -> Result<(), RequestError> {
-        self.requests
-            .try_send(request)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => RequestError::Busy,
-                TrySendError::Disconnected(_) => RequestError::Closed,
-            })
+        let index = match request.pane {
+            PaneId::Left => 0,
+            PaneId::Right => 1,
+        };
+        self.mailboxes[index].request(request)
     }
 
     pub fn try_recv(&self) -> Result<ScanEvent, TryRecvError> {
         self.results.try_recv()
+    }
+}
+
+impl Drop for DirectoryScanner {
+    fn drop(&mut self) {
+        for mailbox in &self.mailboxes {
+            let mut state = mailbox
+                .state
+                .lock()
+                .expect("directory request queue poisoned");
+            state.closed = true;
+            state.pending = None;
+            if let Some(cancelled) = state.current.take() {
+                cancelled.store(true, Ordering::Release);
+            }
+            mailbox.ready.notify_all();
+        }
     }
 }
 
@@ -138,22 +185,42 @@ impl Default for DirectoryScanner {
     }
 }
 
-fn worker_loop(requests: Arc<Mutex<Receiver<ScanRequest>>>, results: SyncSender<ScanEvent>) {
+fn worker_loop(requests: Arc<ScanMailbox>, results: SyncSender<ScanEvent>) {
     loop {
-        let request = {
-            let receiver = requests.lock().expect("directory request queue poisoned");
-            receiver.recv()
+        let (request, cancelled) = {
+            let mut state = requests
+                .state
+                .lock()
+                .expect("directory request queue poisoned");
+            while state.pending.is_none() && !state.closed {
+                state = requests
+                    .ready
+                    .wait(state)
+                    .expect("directory request queue poisoned");
+            }
+            if state.closed {
+                return;
+            }
+            state.pending.take().expect("directory request disappeared")
         };
-        let Ok(request) = request else {
-            break;
+        let is_cancelled = || cancelled.load(Ordering::Acquire);
+        if is_cancelled() {
+            continue;
+        }
+        let result = match request.location {
+            ScanLocation::Directory(path) => scan_directory_cancellable(&path, is_cancelled),
+            ScanLocation::Drives => Some(scan_drives()),
         };
+        let Some(result) = result else {
+            continue;
+        };
+        if is_cancelled() {
+            continue;
+        }
         let event = ScanEvent {
             pane: request.pane,
             generation: request.generation,
-            result: match request.location {
-                ScanLocation::Directory(path) => scan_directory(&path),
-                ScanLocation::Drives => scan_drives(),
-            },
+            result,
         };
         if results.send(event).is_err() {
             break;
@@ -162,14 +229,33 @@ fn worker_loop(requests: Arc<Mutex<Receiver<ScanRequest>>>, results: SyncSender<
 }
 
 pub fn scan_directory(path: &Path) -> Result<DirectoryListing, ScanError> {
-    let reader = fs::read_dir(path).map_err(ScanError::from_io)?;
+    scan_directory_cancellable(path, || false).expect("uncancelled scan")
+}
+
+fn scan_directory_cancellable(
+    path: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Option<Result<DirectoryListing, ScanError>> {
+    if cancelled() {
+        return None;
+    }
+    let mut reader = match fs::read_dir(path) {
+        Ok(reader) => reader,
+        Err(error) => return Some(Err(ScanError::from_io(error))),
+    };
     let mut entries = Vec::new();
     if let Some(parent) = parent_entry(path) {
         entries.push(parent);
     }
     let mut truncated = false;
     let mut discovered = 0;
-    for item in reader {
+    loop {
+        if cancelled() {
+            return None;
+        }
+        let Some(item) = reader.next() else {
+            break;
+        };
         if discovered == MAX_DIRECTORY_ENTRIES {
             truncated = true;
             break;
@@ -216,7 +302,7 @@ pub fn scan_directory(path: &Path) -> Result<DirectoryListing, ScanError> {
         });
         discovered += 1;
     }
-    Ok(DirectoryListing { entries, truncated })
+    Some(Ok(DirectoryListing { entries, truncated }))
 }
 
 fn parent_entry(path: &Path) -> Option<FileEntry> {
@@ -380,15 +466,12 @@ fn scan_drives() -> Result<DirectoryListing, ScanError> {
 
 pub fn sanitize_display_name(name: &str) -> String {
     name.chars()
-        .flat_map(|character| {
+        .map(|character| {
             if character.is_control() || is_bidirectional_control(character) {
                 char::REPLACEMENT_CHARACTER
             } else {
                 character
             }
-            .to_string()
-            .chars()
-            .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -404,6 +487,42 @@ fn is_bidirectional_control(character: char) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn pending_navigation_is_replaced_and_running_request_is_cancelled() {
+        let mailbox = ScanMailbox::default();
+        let request = |generation| ScanRequest {
+            pane: PaneId::Left,
+            generation,
+            location: ScanLocation::Directory(PathBuf::from("unused")),
+        };
+        mailbox.request(request(1)).unwrap();
+        let (_, running) = mailbox.state.lock().unwrap().pending.take().unwrap();
+        mailbox.request(request(2)).unwrap();
+        assert!(running.load(Ordering::Acquire));
+        let queued = mailbox.state.lock().unwrap().current.clone().unwrap();
+        mailbox.request(request(3)).unwrap();
+        assert!(queued.load(Ordering::Acquire));
+        let (latest, cancelled) = mailbox.state.lock().unwrap().pending.take().unwrap();
+        assert_eq!(latest.generation, 3);
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn directory_scan_cancels_before_open_and_between_entries() {
+        use std::cell::Cell;
+        assert!(scan_directory_cancellable(Path::new("missing"), || true).is_none());
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("one"), b"1").unwrap();
+        fs::write(temp.path().join("two"), b"2").unwrap();
+        let checks = Cell::new(0);
+        let result = scan_directory_cancellable(temp.path(), || {
+            checks.set(checks.get() + 1);
+            checks.get() == 3
+        });
+        assert!(result.is_none());
+        assert_eq!(checks.get(), 3);
+    }
 
     #[test]
     fn scan_lists_files_and_directories_without_mutating_them() {

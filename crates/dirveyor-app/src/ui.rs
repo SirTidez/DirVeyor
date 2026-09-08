@@ -600,7 +600,7 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
     }
     let indices = pane.visible_indices();
     if indices.is_empty() && !pane.browsing_drives {
-        let message = if pane.filter.is_empty() {
+        let message = if pane.filter().is_empty() {
             "This folder is empty"
         } else {
             "No items match the filter"
@@ -614,8 +614,24 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
         return;
     }
 
-    let rows = browser_rows(pane, &indices);
     let height = area.height as usize;
+    // Ordinary folders can contain tens of thousands of entries. Materialize
+    // only the viewport; the small drive view still needs its group headings.
+    let rows = if pane.browsing_drives {
+        browser_rows(pane, indices)
+    } else {
+        let start = pane.cursor.saturating_sub(height.saturating_sub(1));
+        indices
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(height)
+            .map(|(visible_position, &entry_index)| BrowserRow::Entry {
+                visible_position,
+                entry_index,
+            })
+            .collect()
+    };
     let focused_row = rows
         .iter()
         .position(|row| matches!(row, BrowserRow::Entry { visible_position, .. } if *visible_position == pane.cursor))
@@ -644,7 +660,7 @@ fn render_entries(frame: &mut Frame, area: Rect, pane: &PaneState, active: bool)
             lines.push(Line::styled(text, style));
             continue;
         };
-        let entry = &pane.entries[*entry_index];
+        let entry = &pane.entries()[*entry_index];
         let focused = active && *visible_position == pane.cursor;
         let selected = pane.selected.contains(&entry.path);
         let cursor = if focused { ">" } else { " " };
@@ -751,7 +767,7 @@ fn append_drive_group(
     rows.push(BrowserRow::Heading(heading));
     let before = rows.len();
     for (visible_position, entry_index) in indices.iter().enumerate() {
-        if pane.entries[*entry_index].kind == kind {
+        if pane.entries()[*entry_index].kind == kind {
             rows.push(BrowserRow::Entry {
                 visible_position,
                 entry_index: *entry_index,
@@ -820,17 +836,21 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
     lines.extend([
         Line::raw(""),
         Line::styled("Pane", Style::default().fg(Color::DarkGray)),
-        Line::raw(format!("Sort: {}", pane.sort.label())),
+        Line::raw(format!("Sort: {}", pane.sort().label())),
         Line::raw(format!(
             "Hidden: {}",
-            if pane.show_hidden { "shown" } else { "hidden" }
+            if pane.show_hidden() {
+                "shown"
+            } else {
+                "hidden"
+            }
         )),
         Line::raw(format!(
             "Filter: {}",
-            if pane.filter.is_empty() {
+            if pane.filter().is_empty() {
                 "—"
             } else {
-                &pane.filter
+                pane.filter()
             }
         )),
         if pane.truncated {
@@ -839,7 +859,7 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &AppState) {
                 Style::default().fg(Color::Yellow),
             )
         } else {
-            Line::raw(format!("Loaded: {} items", pane.entries.len()))
+            Line::raw(format!("Loaded: {} items", pane.entries().len()))
         },
         Line::raw(""),
         Line::styled("← Back · → Open/select", Style::default().fg(Color::Cyan)),
@@ -1026,7 +1046,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let text = if app.filter_mode {
         format!(
             " / {}_    Enter Apply  Esc Close  Backspace Delete",
-            app.active().filter
+            app.active().filter()
         )
     } else if area.width >= 110 {
         format!(
@@ -1963,15 +1983,18 @@ mod tests {
         for pane_id in PaneId::ALL {
             let pane = app.pane_mut(pane_id);
             pane.load_state = LoadState::Ready;
-            pane.entries = vec![FileEntry {
-                path: pane.location.join("example.txt"),
-                display_name: "example.txt".into(),
-                kind: EntryKind::File,
-                size: Some(1_024),
-                modified: None,
-                metadata_incomplete: false,
-                drive_info: None,
-            }];
+            pane.apply_entries(
+                pane.generation,
+                vec![FileEntry {
+                    path: pane.location.join("example.txt"),
+                    display_name: "example.txt".into(),
+                    kind: EntryKind::File,
+                    size: Some(1_024),
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                }],
+            );
         }
         app
     }
@@ -2061,6 +2084,28 @@ mod tests {
     }
 
     #[test]
+    fn directory_viewport_keeps_a_late_focused_row_visible() {
+        let mut app = populated_app();
+        let pane = app.pane_mut(PaneId::Left);
+        let template = pane.entries()[0].clone();
+        pane.apply_entries(
+            pane.generation,
+            (0..1000)
+                .map(|index| FileEntry {
+                    path: PathBuf::from(format!("row_{index:04}")),
+                    display_name: format!("row_{index:04}"),
+                    ..template.clone()
+                })
+                .collect(),
+        );
+        pane.move_cursor(950);
+        let screen = rendered_screen(&app, 120, 30);
+        assert!(screen.contains("row_0950"));
+        assert!(!screen.contains("row_0000"));
+        assert!(!screen.contains("row_0999"));
+    }
+
+    #[test]
     fn renders_minimum_size_message_for_small_terminal() {
         let backend = TestBackend::new(60, 15);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2101,21 +2146,24 @@ mod tests {
         let mut app = populated_app();
         let pane = app.pane_mut(PaneId::Left);
         pane.browsing_drives = true;
-        pane.entries = vec![FileEntry {
-            path: PathBuf::from("D:\\"),
-            display_name: "D:\\  Data".into(),
-            kind: EntryKind::Drive,
-            size: None,
-            modified: None,
-            metadata_incomplete: false,
-            drive_info: Some(DriveInfo {
-                kind: DriveKind::Fixed,
-                label: Some("Data".into()),
-                filesystem: Some("NTFS".into()),
-                total_bytes: Some(1_000),
-                available_bytes: Some(250),
-            }),
-        }];
+        pane.apply_entries(
+            pane.generation,
+            vec![FileEntry {
+                path: PathBuf::from("D:\\"),
+                display_name: "D:\\  Data".into(),
+                kind: EntryKind::Drive,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: Some(DriveInfo {
+                    kind: DriveKind::Fixed,
+                    label: Some("Data".into()),
+                    filesystem: Some("NTFS".into()),
+                    total_bytes: Some(1_000),
+                    available_bytes: Some(250),
+                }),
+            }],
+        );
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2281,15 +2329,18 @@ mod tests {
     fn focused_folder_renders_contained_size_and_drive_share() {
         let mut app = populated_app();
         let folder_path = PathBuf::from("left").join("folder");
-        app.pane_mut(PaneId::Left).entries = vec![FileEntry {
-            path: folder_path.clone(),
-            display_name: "folder".into(),
-            kind: EntryKind::Directory,
-            size: None,
-            modified: None,
-            metadata_incomplete: false,
-            drive_info: None,
-        }];
+        app.pane_mut(PaneId::Left).apply_entries(
+            0,
+            vec![FileEntry {
+                path: folder_path.clone(),
+                display_name: "folder".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
         app.folder_size = FolderSizeState::Ready(dirveyor_domain::FolderSizeSummary {
             request_id: 3,
             pane: PaneId::Left,
@@ -2322,15 +2373,18 @@ mod tests {
     fn folder_size_progress_renders_live_counts_and_discovered_size() {
         let mut app = populated_app();
         let folder_path = PathBuf::from("left").join("folder");
-        app.pane_mut(PaneId::Left).entries = vec![FileEntry {
-            path: folder_path.clone(),
-            display_name: "folder".into(),
-            kind: EntryKind::Directory,
-            size: None,
-            modified: None,
-            metadata_incomplete: false,
-            drive_info: None,
-        }];
+        app.pane_mut(PaneId::Left).apply_entries(
+            0,
+            vec![FileEntry {
+                path: folder_path.clone(),
+                display_name: "folder".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified: None,
+                metadata_incomplete: false,
+                drive_info: None,
+            }],
+        );
         app.folder_size = FolderSizeState::Loading(dirveyor_domain::FolderSizeProgress {
             request_id: 9,
             pane: PaneId::Left,
@@ -2446,35 +2500,38 @@ mod tests {
         let mut app = populated_app();
         let pane = app.pane_mut(PaneId::Left);
         pane.browsing_drives = true;
-        pane.entries = vec![
-            FileEntry {
-                path: PathBuf::from(r"C:\Users\tester"),
-                display_name: r"tester  C:\Users\tester".into(),
-                kind: EntryKind::Home,
-                size: None,
-                modified: None,
-                metadata_incomplete: false,
-                drive_info: None,
-            },
-            FileEntry {
-                path: PathBuf::from(r"D:\Projects"),
-                display_name: r"Projects  D:\Projects".into(),
-                kind: EntryKind::Favorite,
-                size: None,
-                modified: None,
-                metadata_incomplete: false,
-                drive_info: None,
-            },
-            FileEntry {
-                path: PathBuf::from("D:\\"),
-                display_name: "D:\\".into(),
-                kind: EntryKind::Drive,
-                size: None,
-                modified: None,
-                metadata_incomplete: true,
-                drive_info: None,
-            },
-        ];
+        pane.apply_entries(
+            pane.generation,
+            vec![
+                FileEntry {
+                    path: PathBuf::from(r"C:\Users\tester"),
+                    display_name: r"tester  C:\Users\tester".into(),
+                    kind: EntryKind::Home,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+                FileEntry {
+                    path: PathBuf::from(r"D:\Projects"),
+                    display_name: r"Projects  D:\Projects".into(),
+                    kind: EntryKind::Favorite,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: false,
+                    drive_info: None,
+                },
+                FileEntry {
+                    path: PathBuf::from("D:\\"),
+                    display_name: "D:\\".into(),
+                    kind: EntryKind::Drive,
+                    size: None,
+                    modified: None,
+                    metadata_incomplete: true,
+                    drive_info: None,
+                },
+            ],
+        );
 
         let screen = rendered_screen(&app, 120, 30);
 

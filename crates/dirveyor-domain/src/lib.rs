@@ -215,17 +215,19 @@ pub enum LoadState {
 #[derive(Clone, Debug)]
 pub struct PaneState {
     pub location: PathBuf,
-    pub entries: Vec<FileEntry>,
+    entries: Vec<FileEntry>,
     pub cursor: usize,
     pub selected: HashSet<PathBuf>,
-    pub filter: String,
-    pub show_hidden: bool,
-    pub sort: SortField,
+    filter: String,
+    show_hidden: bool,
+    sort: SortField,
     pub load_state: LoadState,
     pub generation: u64,
     pub truncated: bool,
     pub browsing_drives: bool,
     focus_after_load: Option<PathBuf>,
+    normalized_names: Vec<String>,
+    visible: Vec<usize>,
 }
 
 impl PaneState {
@@ -243,6 +245,8 @@ impl PaneState {
             truncated: false,
             browsing_drives: false,
             focus_after_load: None,
+            normalized_names: Vec::new(),
+            visible: Vec::new(),
         }
     }
 
@@ -256,7 +260,7 @@ impl PaneState {
         focus_after_load: Option<PathBuf>,
     ) -> u64 {
         self.location = location;
-        self.entries.clear();
+        self.clear_entries();
         self.cursor = 0;
         self.selected.clear();
         self.load_state = LoadState::Loading;
@@ -273,7 +277,7 @@ impl PaneState {
 
     pub fn begin_drive_list_restoring_focus(&mut self, focus_after_load: Option<PathBuf>) -> u64 {
         self.location = PathBuf::new();
-        self.entries.clear();
+        self.clear_entries();
         self.cursor = 0;
         self.selected.clear();
         self.load_state = LoadState::Loading;
@@ -299,6 +303,11 @@ impl PaneState {
             return false;
         }
         self.entries = entries;
+        self.normalized_names = self
+            .entries
+            .iter()
+            .map(|entry| entry.display_name.to_lowercase())
+            .collect();
         self.sort_entries();
         if let Some(target) = self.focus_after_load.take() {
             self.restore_focus(&target);
@@ -315,26 +324,60 @@ impl PaneState {
         if generation != self.generation {
             return false;
         }
-        self.entries.clear();
+        self.clear_entries();
         self.cursor = 0;
         self.load_state = LoadState::Failed(message);
         self.truncated = false;
         true
     }
 
-    pub fn visible_indices(&self) -> Vec<usize> {
+    pub fn entries(&self) -> &[FileEntry] {
+        &self.entries
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    pub fn sort(&self) -> SortField {
+        self.sort
+    }
+
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.rebuild_visible();
+        self.cursor = self.cursor.min(self.visible_len().saturating_sub(1));
+    }
+
+    fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.normalized_names.clear();
+        self.visible.clear();
+    }
+
+    fn rebuild_visible(&mut self) {
         let needle = self.filter.to_lowercase();
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                entry.is_parent()
-                    || ((self.show_hidden || !is_dot_hidden(&entry.display_name))
-                        && (needle.is_empty()
-                            || entry.display_name.to_lowercase().contains(&needle)))
-            })
-            .map(|(index, _)| index)
-            .collect()
+        self.visible.clear();
+        self.visible.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(index, entry)| {
+                    entry.is_parent()
+                        || ((self.show_hidden || !is_dot_hidden(&entry.display_name))
+                            && (needle.is_empty()
+                                || self.normalized_names[*index].contains(&needle)))
+                })
+                .map(|(index, _)| index),
+        );
+    }
+
+    pub fn visible_indices(&self) -> &[usize] {
+        &self.visible
     }
 
     pub fn visible_len(&self) -> usize {
@@ -365,6 +408,7 @@ impl PaneState {
 
     pub fn set_filter(&mut self, filter: String) {
         self.filter = filter;
+        self.rebuild_visible();
         self.cursor = self.cursor.min(self.visible_len().saturating_sub(1));
     }
 
@@ -392,16 +436,18 @@ impl PaneState {
 
     fn sort_entries(&mut self) {
         let sort = self.sort;
-        self.entries.sort_by(|a, b| {
+        let mut keyed: Vec<_> = self
+            .entries
+            .drain(..)
+            .zip(self.normalized_names.drain(..))
+            .collect();
+        keyed.sort_by(|(a, a_name), (b, b_name)| {
             let kind_order = entry_sort_group(a.kind).cmp(&entry_sort_group(b.kind));
             if !kind_order.is_eq() {
                 return kind_order;
             }
             let primary = match sort {
-                SortField::Name => a
-                    .display_name
-                    .to_lowercase()
-                    .cmp(&b.display_name.to_lowercase()),
+                SortField::Name => a_name.cmp(b_name),
                 SortField::Size => a.size.cmp(&b.size),
                 SortField::Modified => a.modified.cmp(&b.modified),
             };
@@ -409,6 +455,12 @@ impl PaneState {
                 .then_with(|| a.display_name.cmp(&b.display_name))
                 .then_with(|| a.path.cmp(&b.path))
         });
+        self.normalized_names.clear();
+        for (entry, name) in keyed {
+            self.entries.push(entry);
+            self.normalized_names.push(name);
+        }
+        self.rebuild_visible();
     }
 
     fn restore_focus(&mut self, target: &Path) {
@@ -423,6 +475,7 @@ impl PaneState {
         });
         if position.is_none() && target_exists && !self.filter.is_empty() {
             self.filter.clear();
+            self.rebuild_visible();
             position = self.visible_indices().iter().position(|&index| {
                 self.entries
                     .get(index)
@@ -616,6 +669,65 @@ mod tests {
             metadata_incomplete: false,
             drive_info: None,
         }
+    }
+
+    #[test]
+    fn visible_view_tracks_filter_hidden_sort_and_load_transitions() {
+        let mut pane = PaneState::new(PathBuf::from("root"));
+        pane.apply_entries(
+            0,
+            vec![
+                entry("..", EntryKind::Parent, 0),
+                entry(".ALPHA", EntryKind::File, 1),
+                entry("Alpha", EntryKind::File, 5),
+                entry("beta", EntryKind::File, 2),
+            ],
+        );
+        assert_eq!(pane.visible_len(), 3);
+        pane.set_filter("ALPHA".into());
+        assert_eq!(pane.visible_len(), 2);
+        pane.toggle_hidden();
+        assert_eq!(pane.visible_len(), 3);
+        pane.move_cursor(2);
+        assert_eq!(pane.focused().unwrap().display_name, "Alpha");
+        pane.cycle_sort();
+        assert_eq!(pane.focused().unwrap().display_name, "Alpha");
+        pane.set_filter(String::new());
+        assert_eq!(pane.visible_len(), 4);
+        let generation = pane.begin_load(PathBuf::from("next"));
+        assert!(pane.visible_indices().is_empty());
+        assert!(pane.focused().is_none());
+        assert!(!pane.apply_entries(0, vec![entry("stale", EntryKind::File, 1)]));
+        pane.apply_entries(generation, vec![entry("fresh", EntryKind::File, 1)]);
+        assert_eq!(pane.focused().unwrap().display_name, "fresh");
+        pane.apply_error(generation, "unavailable".into());
+        assert!(pane.visible_indices().is_empty());
+        let generation = pane.begin_drive_list();
+        pane.apply_entries(generation, vec![entry("drive", EntryKind::Drive, 0)]);
+        assert_eq!(pane.visible_len(), 1);
+    }
+
+    #[test]
+    fn cached_names_preserve_unicode_filtering_and_name_ties() {
+        let mut pane = PaneState::new(PathBuf::from("root"));
+        pane.apply_entries(
+            0,
+            vec![
+                entry("ä.txt", EntryKind::File, 1),
+                entry("Ä.txt", EntryKind::File, 1),
+                entry("a.txt", EntryKind::File, 1),
+            ],
+        );
+        assert_eq!(
+            pane.entries()
+                .iter()
+                .map(|e| e.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.txt", "Ä.txt", "ä.txt"]
+        );
+        pane.set_filter("Ä".into());
+        assert_eq!(pane.visible_len(), 2);
+        assert_eq!(pane.focused().unwrap().display_name, "Ä.txt");
     }
 
     #[test]

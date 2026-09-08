@@ -374,11 +374,17 @@ fn count_transfer_tree(
                         source.display()
                     )
                 })?;
+                let child_path = child.path();
+                let metadata = child
+                    .metadata()
+                    .map_err(|error| format!("Cannot inspect {}: {error}", child_path.display()))?;
+                reject_link_or_special(&child_path, &metadata)?;
+                let child_fingerprint = fingerprint(&metadata)?;
                 count_transfer_tree(
                     job,
                     kind,
-                    &child.path(),
-                    None,
+                    &child_path,
+                    Some(&child_fingerprint),
                     item_count,
                     file_count,
                     total_bytes,
@@ -751,11 +757,17 @@ fn collect_delete_manifest(
                         source.display()
                     )
                 })?;
+                let child_path = child.path();
+                let metadata = child
+                    .metadata()
+                    .map_err(|error| format!("Cannot inspect {}: {error}", child_path.display()))?;
+                reject_link_or_special(&child_path, &metadata)?;
+                let child_fingerprint = fingerprint(&metadata)?;
                 collect_delete_manifest(
                     job,
                     kind,
-                    &child.path(),
-                    None,
+                    &child_path,
+                    Some(&child_fingerprint),
                     manifest,
                     item_count,
                     file_count,
@@ -1205,6 +1217,50 @@ mod tests {
             permanent.action,
             PlannedAction::PermanentDelete { .. }
         ));
+    }
+
+    #[test]
+    fn nested_manifest_preserves_child_fingerprints_and_postorder() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let child = nested.join("child.txt");
+        fs::write(&child, b"original").unwrap();
+        let plan = build_plan(
+            JobId(77),
+            OperationIntent::PermanentDelete {
+                sources: vec![root.clone()],
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.summary.item_count, 3);
+        assert_eq!(plan.summary.total_bytes, 8);
+        let PlannedAction::PermanentDelete { mut manifest } = plan.action else {
+            panic!("expected delete manifest");
+        };
+        std::io::Seek::rewind(&mut manifest).unwrap();
+        let (path, fingerprint) = read_delete_manifest_entry(&mut manifest).unwrap().unwrap();
+        assert_eq!(path, child);
+        revalidate(&child, &fingerprint).unwrap();
+        assert_eq!(
+            read_delete_manifest_entry(&mut manifest)
+                .unwrap()
+                .unwrap()
+                .0,
+            nested
+        );
+        assert_eq!(
+            read_delete_manifest_entry(&mut manifest)
+                .unwrap()
+                .unwrap()
+                .0,
+            root
+        );
+        assert!(read_delete_manifest_entry(&mut manifest).unwrap().is_none());
+        fs::write(&child, b"changed length").unwrap();
+        assert!(revalidate(&child, &fingerprint).is_err());
     }
 
     #[test]
