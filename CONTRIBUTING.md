@@ -19,6 +19,9 @@ powershell -NoProfile -File tests/installer.tests.ps1
 ```
 
 The Windows CI matrix tests stable Rust and the minimum supported version.
+Before release validation, refresh the local stable toolchain with
+`rustup update stable` and run checks using `cargo +stable`. GitHub installs the
+latest stable compiler, whose Clippy checks may be newer than a local toolchain.
 Linux/macOS runtime support has not been validated. Installer tests mock GitHub
 downloads, use temporary directories, and do not change the real user PATH.
 

@@ -1049,7 +1049,9 @@ fn encode_path(path: &Path) -> Vec<u8> {
 fn decode_path(bytes: Vec<u8>) -> PathBuf {
     use std::os::windows::ffi::OsStringExt;
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     std::ffi::OsString::from_wide(&units).into()
