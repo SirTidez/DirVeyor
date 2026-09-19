@@ -208,7 +208,12 @@ impl LaunchContext {
 fn queue_initial_scans(app: &mut AppState, scanner: &DirectoryScanner, launch: &LaunchContext) {
     for pane_id in PaneId::ALL {
         let resumed = match pane_id {
-            PaneId::Left => launch.left.clone(),
+            PaneId::Left => Some(
+                launch
+                    .left
+                    .clone()
+                    .unwrap_or_else(|| app.pane(PaneId::Left).location.clone()),
+            ),
             PaneId::Right => launch.right.clone(),
         };
         let focus = match pane_id {
@@ -1750,7 +1755,7 @@ mod preview_tests {
     };
 
     #[test]
-    fn startup_places_both_panes_in_the_all_drives_view() {
+    fn startup_opens_launch_directory_on_left_and_drives_on_right() {
         let scanner = DirectoryScanner::new();
         let mut app = AppState::new(PathBuf::from("left"), PathBuf::from("right"));
 
@@ -1768,9 +1773,93 @@ mod preview_tests {
 
         for pane_id in PaneId::ALL {
             let pane = app.pane(pane_id);
-            assert!(pane.browsing_drives);
+            assert_eq!(pane.browsing_drives, pane_id == PaneId::Right);
             assert!(matches!(pane.load_state, LoadState::Loading));
             assert_eq!(pane.generation, 1);
+        }
+        assert_eq!(app.pane(PaneId::Left).location, PathBuf::from("left"));
+    }
+
+    #[test]
+    fn startup_scans_multiple_folders_and_preserves_resume_locations() {
+        let temp = tempfile::tempdir().unwrap();
+        let populated = temp.path().join("Project with spaces");
+        let empty = temp.path().join("Empty");
+        let unicode = temp.path().join("Café 日本語");
+        for path in [&populated, &empty, &unicode] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(populated.join("launch-marker.txt"), "example").unwrap();
+        std::fs::write(unicode.join("unicode-marker.txt"), "example").unwrap();
+        let repository = std::env::current_dir().unwrap();
+        for (index, path) in [&populated, &empty, &unicode, &repository]
+            .into_iter()
+            .enumerate()
+        {
+            let scanner = DirectoryScanner::new();
+            let mut app = AppState::new(path.clone(), temp.path().to_path_buf());
+            let launch = LaunchContext {
+                left: None,
+                right: None,
+                left_focus: None,
+                right_focus: None,
+                active: PaneId::Left,
+            };
+            queue_initial_scans(&mut app, &scanner, &launch);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while PaneId::ALL
+                .iter()
+                .any(|id| app.pane(*id).load_state == LoadState::Loading)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "startup scan timed out"
+                );
+                drain_scan_events(&mut app, &scanner);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(app.active_pane, PaneId::Left);
+            assert_eq!(app.pane(PaneId::Left).location, *path);
+            assert!(!app.pane(PaneId::Left).browsing_drives);
+            assert!(app.pane(PaneId::Right).browsing_drives);
+            for id in PaneId::ALL {
+                assert_eq!(app.pane(id).load_state, LoadState::Ready);
+            }
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 38)).unwrap();
+            terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(140)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(screen.contains("All drives"));
+            if index == 0 {
+                assert!(screen.contains("launch-marker.txt"));
+            }
+            if index == 2 {
+                assert!(screen.contains("unicode-marker.txt"));
+            }
+            if let Some(output) = std::env::var_os("DIRVEYOR_STARTUP_SNAPSHOTS") {
+                let output = PathBuf::from(output);
+                std::fs::create_dir_all(&output).unwrap();
+                std::fs::write(output.join(format!("startup-{index}.txt")), screen).unwrap();
+            }
+
+            let resumed = LaunchContext {
+                left: Some(empty.clone()),
+                right: Some(populated.clone()),
+                left_focus: None,
+                right_focus: Some(populated.join("launch-marker.txt")),
+                active: PaneId::Right,
+            };
+            queue_initial_scans(&mut app, &scanner, &resumed);
+            assert_eq!(app.pane(PaneId::Left).location, empty);
+            assert_eq!(app.pane(PaneId::Right).location, populated);
+            assert!(!app.pane(PaneId::Left).browsing_drives);
+            assert!(!app.pane(PaneId::Right).browsing_drives);
         }
     }
 

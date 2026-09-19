@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — Unreleased
+
+- Open the terminal's current working folder in the left pane on startup,
+  with the All drives overview in the right pane. Explicit pane locations
+  used for administrator relaunch continue to take precedence.
+
 ## 0.1.0 — Unreleased
 
 - Windows-first two-pane terminal browser with drive information, favorites,

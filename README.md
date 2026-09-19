@@ -7,7 +7,7 @@ management. It combines a keyboard-first two-pane browser with an explicit
 operation review, device-aware transfer planning, and safety-focused previews.
 
 **Status: early development, Windows x64.** The current source version is
-0.1.0. Linux and macOS are not currently supported releases. Automated checks
+0.2.0. Linux and macOS are not currently supported releases. Automated checks
 cover state, rendering, planning, and read-only scanning; file-changing release
 acceptance still requires an attended run against disposable data.
 
@@ -96,9 +96,11 @@ and Cargo are not required for packaged builds. Launch from a terminal:
 .\dirveyor.exe
 ```
 
-Use a terminal at least 80×24 characters. Both browser panes initially show All
-drives, so behavior does not depend on the folder from which the executable was
-started.
+Use a terminal at least 80×24 characters. The first (left) pane opens the
+terminal's current working folder, and the second (right) pane shows All drives.
+For example, running `dirveyor` after changing to a project folder opens that
+project immediately. Relaunching with administrator privileges preserves the
+explicit pane locations supplied by the application.
 
 ### Interface tour
 

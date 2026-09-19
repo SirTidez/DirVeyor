@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "dirveyor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "dirveyor-domain",
@@ -248,11 +248,11 @@ dependencies = [
 
 [[package]]
 name = "dirveyor-domain"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dirveyor-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "dirveyor-domain",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "dirveyor-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirveyor-domain",
  "pulldown-cmark",
